@@ -1,0 +1,72 @@
+--- a/paginator.js
++++ b/paginator.js
+@@ -557,12 +557,12 @@ export class Paginator extends HTMLElement {
+              * in a wide window is the middle of the page rather than the edge
+              * of the reading area. Padding moves the content and leaves the
+              * bar on the border box, where the platform draws it. */
+-            padding-inline-start: var(--paper-scroll-pad-start, 0px);
+-            padding-inline-end: var(--paper-scroll-pad-end, 0px);
++            padding-inline-start: var(--carta-scroll-pad-start, 0px);
++            padding-inline-end: var(--carta-scroll-pad-end, 0px);
+             /* scrollbar-width is NOT an inherited property, so a host cannot
+              * reach it through the closed root the way it can with a custom
+              * property. This indirection is the whole point. */
+-            scrollbar-width: var(--paper-scrollbar-width, auto);
++            scrollbar-width: var(--carta-scrollbar-width, auto);
+         }
+         #header {
+             grid-column: 3 / 4;
+@@ -941,6 +941,7 @@
+             element[scrollProp] + delta))
+     }
+     snap(vx, vy) {
++        if (this.#locked) return
+         const velocity = this.#vertical ? vy : vx
+         const [offset, a, b] = this.#scrollBounds
+         const { start, end, pages, size } = this
+@@ -970,9 +971,11 @@
+         })
+     }
+     #onTouchStart(e) {
++        this.#touchScrolled = false
+         const touch = e.changedTouches[0]
+         this.#touchState = {
+             x: touch?.screenX, y: touch?.screenY,
++            originX: touch?.screenX, originY: touch?.screenY,
+             t: e.timeStamp,
+             vx: 0, xy: 0,
+         }
+@@ -987,8 +990,12 @@
+             return
+         }
+         e.preventDefault()
++        if (this.#locked) return
+         const touch = e.changedTouches[0]
+         const x = touch.screenX, y = touch.screenY
++        // Match Carta's tap tolerance: a small thumb wobble is still a tap,
++        // not a drag followed by a competing snap animation.
++        if (!this.#touchScrolled && Math.hypot(x - state.originX, y - state.originY) <= 24) return
+         const dx = state.x - x, dy = state.y - y
+         const dt = e.timeStamp - state.t
+         state.x = x
+@@ -1000,15 +1007,18 @@
+         this.scrollBy(dx, dy)
+     }
+     #onTouchEnd() {
++        if (!this.#touchScrolled) return
+         this.#touchScrolled = false
+         if (this.scrolled) return
+ 
+         // XXX: Firefox seems to report scale as 1... sometimes...?
+         // at this point I'm basically throwing `requestAnimationFrame` at
+         // anything that doesn't work
++        const seq = this.#navSeq
++        const { vx, vy } = this.#touchState
+         requestAnimationFrame(() => {
+-            if (globalThis.visualViewport.scale === 1)
+-                this.snap(this.#touchState.vx, this.#touchState.vy)
++            if (this.#navSeq === seq && globalThis.visualViewport.scale === 1)
++                this.snap(vx, vy)
+         })
+     }
+     // allows one to process rects as if they were LTR and horizontal

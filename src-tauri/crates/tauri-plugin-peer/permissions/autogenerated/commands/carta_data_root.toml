@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-carta-data-root"
+description = "Enables the carta_data_root command without any pre-configured scope."
+commands.allow = ["carta_data_root"]
+
+[[permission]]
+identifier = "deny-carta-data-root"
+description = "Denies the carta_data_root command without any pre-configured scope."
+commands.deny = ["carta_data_root"]

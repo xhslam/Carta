@@ -1,0 +1,973 @@
+//! The commands. Each is one line of policy on top of a module that does the
+//! work, so the modules stay testable without a Tauri app.
+//!
+//! Adding a command means four edits: here, `generate_handler!` in `lib.rs`,
+//! `COMMANDS` in `build.rs`, and `permissions/default.toml`. Miss the handler
+//! or the build list and the command is unreachable; miss the ACL and it is
+//! refused.
+//!
+//! # There is no general runner here, and that is the design
+//!
+//! Read the signatures: no command takes a URL, a path, a host, an argv or a
+//! model file. A caller names a MODEL ID that must resolve in
+//! `models.manifest.json`, or a ROUTE ID the probe minted, and nothing else.
+//! Untrusted book HTML renders in the webview that calls these, and the
+//! daemon behind them installs and executes backend binaries — so the closed
+//! argument set is not defensiveness, it is the boundary the whole crate
+//! exists to hold.
+//!
+//! # Streaming goes over a Channel, not a returned stream
+//!
+//! F5 again: handing the webview the bearer token to get native `fetch`
+//! streaming would hand book HTML a backend installer. So the token stays in
+//! Rust and text comes back over a Tauri `Channel<T>` the caller supplies.
+//! Every streaming command takes a `request_id` the CALLER minted, and
+//! `inference_cancel(requestId)` cancels any of them — see `requests.rs` for
+//! why the caller mints it.
+
+use serde::Serialize;
+use tauri::ipc::Channel;
+use tauri::{AppHandle, Runtime, State};
+
+use crate::agent::{self, Agent};
+use crate::agentask;
+use crate::endpoints::Endpoint;
+use crate::error::{Error, Result};
+use crate::generate::{self, ChatRequest, Message};
+use crate::install::{self, Progress};
+use crate::limits;
+use crate::manifest::ModelEntry;
+use crate::probe::{self, Probe, Route};
+use crate::speech;
+use crate::state::{InferenceState, RuntimeStatus};
+
+/* ────────────────────────────── the runtime ─────────────────────────────── */
+
+/// Where the runtime is. Starts nothing.
+#[tauri::command]
+pub async fn inference_status<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+) -> Result<RuntimeStatus> {
+    Ok(state.status(&app).await)
+}
+
+/// Start the daemon. Idempotent; answers the loopback port.
+#[tauri::command]
+pub async fn inference_start<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+) -> Result<u16> {
+    state.ensure_started(&app).await
+}
+
+/// Stop the daemon. Idempotent, and never fails.
+#[tauri::command]
+pub async fn inference_stop(state: State<'_, InferenceState>) -> Result<()> {
+    state.stop().await;
+    Ok(())
+}
+
+/* ────────────────────────────── the catalogue ───────────────────────────── */
+
+/// One row of the Local models section.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRow {
+    pub id: String,
+    pub label: String,
+    pub modality: crate::manifest::Modality,
+    pub license: String,
+    pub bytes: u64,
+    pub installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+}
+
+/// The manifest, with what is on disk.
+#[tauri::command]
+pub async fn inference_models<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+) -> Result<Vec<ModelRow>> {
+    let layout = state.layout(&app)?;
+    let manifest = state.manifest()?;
+    let mut rows = Vec::new();
+    for model in &manifest.models {
+        rows.push(ModelRow {
+            id: model.id.clone(),
+            label: model.label.clone(),
+            modality: model.modality,
+            license: model.license.clone(),
+            bytes: model.total_bytes(),
+            installed: install::is_installed(layout, model).await,
+            parameters: model.parameters.clone(),
+            quantization: model.quantization.clone(),
+        });
+    }
+    Ok(rows)
+}
+
+/// Download, verify and activate a model.
+///
+/// `model` must resolve in the manifest — there is no URL parameter, and a
+/// gallery entry is untrusted input until it has become a manifest entry.
+/// A lock on one model's artifacts, held for as long as the guard lives.
+///
+/// SERIALISED BY WHAT IS WRITTEN, not by who asked. `begin` keys on the
+/// caller's `request_id`, which only stops the same request twice — so two
+/// installs of the SAME model under different ids both ran, both fetched, and
+/// both wrote the staging path derived from that model's id. A remove could
+/// land in the middle of either, because it carries no request id at all.
+///
+/// The registry is reused rather than a second map introduced: the guard's
+/// `Drop` already releases on every exit path, including a cancellation and a
+/// panic, which is the property that makes this safe to hold across an await.
+/// ⚠️ **ITS OWN REGISTRY, AND IT USED TO SHARE THE REQUEST ONE.** This said
+/// "the `model:` prefix cannot collide with a minted request id — those are
+/// `<kind>-<n>`", which is a fact about the ids CARTA mints and not about the
+/// ones this command surface ACCEPTS: `request_id` arrives from the webview
+/// bounded only by `MAX_REQUEST_ID`, and this crate's whole premise is that the
+/// webview is untrusted. A caller passing `model:<id>` as its own request id
+/// held that model's install and removal for as long as it kept the request
+/// open, and an install in progress made a lookup under the same string answer
+/// "already running". Two namespaces in one map is one namespace — see
+/// `InferenceState::model_locks`.
+///
+/// The registry TYPE is still reused rather than a bespoke lock: the guard's
+/// `Drop` already releases on every exit path, including a cancellation and a
+/// panic, which is the property that makes this safe to hold across an await.
+/// The busy error names the model rather than the key.
+fn lock_model(state: &InferenceState, model: &str) -> Result<crate::requests::Guard> {
+    state
+        .model_locks()
+        .begin(model)
+        .map_err(|_| Error::RequestBusy(model.to_owned()))
+}
+
+#[tauri::command]
+pub async fn inference_install_model<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+    request_id: String,
+    model: String,
+    progress: Channel<Progress>,
+) -> Result<()> {
+    limits::within("request id", &request_id, limits::MAX_REQUEST_ID)?;
+    limits::within("model id", &model, limits::MAX_MODEL_ID)?;
+    let guard = state.requests().begin(&request_id)?;
+    let cancel = guard.cancel();
+    /* Held for the whole download, so a second install of this model — or a
+     * remove of it — waits rather than writing the same staging path. */
+    let _artifacts = lock_model(&state, &model)?;
+    let layout = state.layout(&app)?;
+    let manifest = state.manifest()?;
+    let entry: &ModelEntry = manifest.model(&model)?;
+    install::install(state.download_client(), layout, entry, &cancel, |update| {
+        // A send that fails means the webview dropped the channel — the
+        // reader closed the pane. Not a reason to abandon a download they
+        // asked for; the next `inference_models` will show it installed.
+        let _ = progress.send(update);
+    })
+    .await
+}
+
+/// Remove a model's artifacts.
+#[tauri::command]
+pub async fn inference_remove_model<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+    model: String,
+) -> Result<()> {
+    /* BOUNDED BEFORE THE LOCK KEY IS BUILT FROM IT. `lock_model` formats the
+     * id into `model:{model}` and a refusal copies it again into
+     * `RequestBusy` — both happen before `manifest.model(&model)` gets to say
+     * it is not a model at all. Missed when the other model commands were
+     * bounded, because this one reads as a delete rather than as a command
+     * that takes a string. */
+    limits::within("model id", &model, limits::MAX_MODEL_ID)?;
+    /* THE SAME LOCK THE INSTALL TAKES. Removing a model's artifacts while
+     * they are being fetched is the same collision from the other side, and
+     * this command carries no request id to have been serialised by. */
+    let _artifacts = lock_model(&state, &model)?;
+    let layout = state.layout(&app)?;
+    let manifest = state.manifest()?;
+    install::remove(layout, manifest.model(&model)?).await
+}
+
+/// What the runtime is holding. `None` rather than zero when unknown.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceUsage {
+    /// Resident bytes, or `None`. NEVER `0` for "unknown": the settings row
+    /// shows `—` for an absent figure, and Lemonade is specifically credited
+    /// for returning null rather than zero for memory it cannot read. That
+    /// honesty has to survive translation.
+    pub resident_bytes: Option<u64>,
+    /// Which model is resident, as a MANIFEST ID — never the daemon's own
+    /// string.
+    ///
+    /// ⚠️ **THE DAEMON'S MODEL FIELDS CARRY ABSOLUTE ARTIFACT PATHS**, which
+    /// is documented in `daemon.rs` and is why this used to hand the webview a
+    /// path under the reader's home directory. The webview renders untrusted
+    /// book HTML; `agentask.rs` drops paths at its parse boundary for exactly
+    /// this reason, and a health reading is not an exemption from it.
+    ///
+    /// So the daemon's answer is matched against the catalogue and the
+    /// catalogue's id is what crosses. Anything that matches nothing is
+    /// `None`: an unrecognised string is not a fact worth leaking to say.
+    pub model_loaded: Option<String>,
+}
+
+#[tauri::command]
+pub async fn inference_resource_usage(state: State<'_, InferenceState>) -> Result<ResourceUsage> {
+    /* The guard is dropped before the request, as in `inference_generate` —
+    otherwise a memory reading blocks behind whatever is streaming. */
+    let request = {
+        let daemon = state.daemon().await?;
+        daemon.health_request()
+    };
+    let health = crate::daemon::Daemon::read_health(request).await?;
+    Ok(ResourceUsage {
+        // Not reported by `/api/v1/health`; `None` until it is read from a
+        // route that genuinely carries it, rather than a plausible zero.
+        resident_bytes: None,
+        model_loaded: health
+            .model_loaded
+            .and_then(|loaded| manifest_id_for(&state, &loaded)),
+    })
+}
+
+/// The manifest id whose artifacts the daemon's `model_loaded` string names.
+///
+/// Matched by SHAPE rather than by equality, because the daemon answers with
+/// whatever it was handed — a path, a file name, or the id — and only one of
+/// those is safe to forward. `None` when nothing matches.
+fn manifest_id_for(state: &InferenceState, loaded: &str) -> Option<String> {
+    let manifest = state.manifest().ok()?;
+    manifest
+        .models
+        .iter()
+        .find(|model| {
+            /* By FILE NAME, not by suffix: `ends_with` on the raw string let
+             * `/tmp/not-model.gguf` claim the manifest entry for
+             * `model.gguf`. The daemon reports a path; the path's last
+             * component either IS the artifact's file or it is not ours. */
+            loaded == model.id
+                || model.artifacts.iter().any(|artifact| {
+                    std::path::Path::new(&loaded)
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy() == artifact.file)
+                })
+        })
+        .map(|model| model.id.clone())
+}
+
+/// The models folder, for `[Reveal]`. Returns the path; the kernel opens it.
+#[tauri::command]
+pub async fn inference_reveal_models_dir<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+) -> Result<String> {
+    let layout = state.layout(&app)?;
+    layout
+        .models_dir
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::PathNotUnicode(layout.models_dir.clone()))
+}
+
+/* ──────────────────────────────── the probe ─────────────────────────────── */
+
+/// Presence, version and auth for every route (WI-15.10).
+#[tauri::command]
+pub async fn inference_probe<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+) -> Result<Probe> {
+    let layout = state.layout(&app)?;
+    let manifest = state.manifest()?;
+    let runtime_available = crate::paths::bundled_runtime(&app).is_ok();
+
+    // Which local models are actually on disk, awaited before the pure part.
+    let mut installed = std::collections::BTreeSet::new();
+    for model in &manifest.models {
+        if install::is_installed(layout, model).await {
+            installed.insert(model.id.clone());
+        }
+    }
+    let mut routes: Vec<Route> = probe::local_routes(
+        &manifest,
+        |model| installed.contains(&model.id),
+        runtime_available,
+    );
+
+    // Both agents at once: each spawns two short-lived children and there is
+    // no reason for the second to wait on the first.
+    let (codex, claude) = tokio::join!(agent::probe(Agent::Codex), agent::probe(Agent::Claude));
+    routes.push(probe::agent_route(&codex));
+    routes.push(probe::agent_route(&claude));
+
+    /* Whether the DAEMON took each one, which is a separate fact from whether
+    Carta has it stored — see `UnusableReason::NotRegistered`. The list reads
+    the keychain once per endpoint, so it goes through the blocking seam like
+    every other store call (WI-20.20). */
+    let unregistered = state.unregistered().await;
+    for endpoint in state.on_store(&app, |store| store.list()).await? {
+        let registered = !unregistered.contains(&endpoint.id);
+        routes.push(probe::endpoint_route(&endpoint, registered));
+    }
+
+    let runtime_version = match state.status(&app).await {
+        RuntimeStatus::Ready { version, .. } => Some(version),
+        _ => None,
+    };
+    Ok(Probe {
+        routes,
+        runtime_version,
+    })
+}
+
+/* ─────────────────────────────── generation ─────────────────────────────── */
+
+/// How long an answer may be. Bounded here rather than by the caller: a
+/// webview asking for an unbounded generation is a GPU pinned by book HTML.
+const MAX_ANSWER_TOKENS: u32 = 1024;
+
+/// A gloss is one or two sentences. Bounded much lower, because the reader is
+/// waiting beside a word rather than reading a reply.
+const MAX_GLOSS_TOKENS: u32 = 160;
+
+/// Low, and the same for both: this answers from a passage in front of the
+/// reader, and invention is the failure mode §13 exists to prevent.
+const TEMPERATURE: f32 = 0.2;
+
+/// Resolve a caller's model string against what Carta actually has.
+///
+/// ⚠️ **THIS FUNCTION IS THE CLOSED ARGUMENT SET.** Without it the header's
+/// claim above — "a caller names a MODEL ID that must resolve in
+/// `models.manifest.json`" — was simply false: `model` was forwarded to the
+/// daemon verbatim, so untrusted book HTML could name any model the daemon
+/// knows, including one it would pull from a remote registry. An audit caught
+/// it, and it is the exact gap the surrounding comments claimed did not exist.
+///
+/// # Membership is not usability, and it is not modality
+///
+/// ⚠️ The first version checked only that the string appeared in the catalogue,
+/// which is three separate holes at once:
+///
+/// - **an uninstalled model resolved.** `inference_probe` reports it as
+///   `notInstalled` and the pane offers `[Install]`, and this said yes to it —
+///   so a caller bypassing the pane reached the daemon with a model whose
+///   artifacts are not on disk, and got a load failure instead of a refusal.
+/// - **a keyless endpoint resolved.** The probe marks it `noKey` for the same
+///   reason and this did not, so the request went out to be rejected upstream.
+/// - **the modality was never checked.** A speech model resolved for
+///   `inference_generate` and a text model for `inference_speak`. Untrusted
+///   book HTML naming a voice as its answering model is not a hypothetical:
+///   the whole point of the closed set is that the caller is not trusted.
+///
+/// So the check is the same one the probe publishes — `usable()` — rather than
+/// a second, laxer opinion sitting behind it. One decision, two readers.
+///
+/// Still `async`, and now for a reason: the audit's note that this awaited
+/// nothing was true of the membership check it replaces. Asking whether a
+/// model's artifacts are on disk is a filesystem read, and doing it with
+/// `tokio::fs` rather than a blocking twin keeps it off the runtime's thread.
+async fn resolve_model<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &InferenceState,
+    model: &str,
+    wanted: probe::Modality,
+) -> Result<String> {
+    let route = route_for(app, state, model).await?;
+    if !route.usable() {
+        /* The reason is already the reader's sentence, and the pane draws the
+        action that fixes it — this only has to refuse. */
+        return Err(Error::ModelUnknown(model.to_owned()));
+    }
+    if route.modality != wanted {
+        return Err(Error::ModelUnknown(model.to_owned()));
+    }
+    Ok(model.to_owned())
+}
+
+/// The probe's own row for `model`, built the same way `inference_probe` does.
+///
+/// ⚠️ **ONE SELECTION ABSTRACTION, NOT TWO.** `Route::usable` existed and was
+/// used only by this crate's tests, while the commands re-implemented a laxer
+/// membership check and the TypeScript re-implemented usability a third time.
+/// Three opinions about "can this answer" is two too many, and the one that
+/// gated the actual request was the weakest of them.
+async fn route_for<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &InferenceState,
+    model: &str,
+) -> Result<probe::Route> {
+    let manifest = state.manifest()?;
+    if let Ok(entry) = manifest.model(model) {
+        let layout = state.layout(app)?;
+        let runtime_available = crate::paths::bundled_runtime(app).is_ok();
+        let installed = install::is_installed(layout, entry).await;
+        return probe::local_routes(
+            &manifest,
+            |m| m.id == entry.id && installed,
+            runtime_available,
+        )
+        .into_iter()
+        .find(|route| route.id == probe::local_route_id(model))
+        .ok_or_else(|| Error::ModelUnknown(model.to_owned()));
+    }
+    /* The daemon's own verdict, so a route it refused is refused here too
+    rather than reaching it a second time to be refused again. */
+    let unregistered = state.unregistered().await;
+    let endpoints = state.on_store(app, |store| store.list()).await?;
+    endpoints
+        .iter()
+        .find(|endpoint| endpoint.id == model)
+        .map(|endpoint| probe::endpoint_route(endpoint, !unregistered.contains(&endpoint.id)))
+        .ok_or_else(|| Error::ModelUnknown(model.to_owned()))
+}
+
+/// Which agent a route id names. The ids are the probe's own, never a path.
+///
+/// One function rather than the two verbatim copies this replaces: `agent_ask`
+/// and `agent_sign_in` each spelled the match out, including the error
+/// conversion, so a third agent — or a different spelling — would have had to
+/// be added in both.
+fn parse_agent_route(route: &str) -> Result<Agent> {
+    match route {
+        "agent:codex" => Ok(Agent::Codex),
+        "agent:claude" => Ok(Agent::Claude),
+        /* A route id the probe did not mint. Never a path, never an argv —
+         * but `to_owned` here COPIES whatever arrived into an error that
+         * crosses IPC, which is why both callers bound the route first.
+         * `every_string_parameter_of_every_command_is_bounded` in `limits.rs`
+         * is what holds that, rather than this sentence. */
+        other => Err(Error::ModelUnknown(other.to_owned())),
+    }
+}
+
+/// The one chat request builder, so the two callers cannot drift on roles,
+/// temperature or streaming.
+fn chat_request(model: String, system: String, question: String, max_tokens: u32) -> ChatRequest {
+    ChatRequest {
+        model,
+        messages: vec![
+            Message {
+                role: "system",
+                content: system,
+            },
+            Message {
+                role: "user",
+                content: question,
+            },
+        ],
+        max_tokens,
+        temperature: TEMPERATURE,
+        stream: true,
+    }
+}
+
+/// Ask the local runtime, streaming text back over `chunks`.
+#[tauri::command]
+pub async fn inference_generate<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+    request_id: String,
+    model: String,
+    system: String,
+    question: String,
+    chunks: Channel<String>,
+) -> Result<String> {
+    /* BOUNDED BEFORE ANYTHING IS ALLOCATED, REGISTERED OR SENT. A closed
+     * command surface bounds which verbs a webview can reach; it says nothing
+     * about how much can be pushed through one. See `limits.rs`. */
+    limits::within("request id", &request_id, limits::MAX_REQUEST_ID)?;
+    limits::within("model id", &model, limits::MAX_MODEL_ID)?;
+    limits::within("system prompt", &system, limits::MAX_SYSTEM)?;
+    limits::within("question", &question, limits::MAX_QUESTION)?;
+    /* REGISTERED BEFORE THE RESOLVE — the same rule the agent turn records.
+     * `resolve_model` does filesystem and keychain work; a Stop pressed in
+     * that window used to answer `RequestUnknown` and the generation then
+     * started anyway. The token exists first, and the resolve's outcome is
+     * checked against it. */
+    let guard = state.requests().begin(&request_id)?;
+    let cancel = guard.cancel();
+    let model = resolve_model(&app, &state, &model, probe::Modality::Text).await?;
+    cancel.check()?;
+    /* ⚠️ THE DAEMON LOCK IS DROPPED BEFORE THE NETWORK WAIT. `state.daemon()`
+     * hands back a mapped mutex guard, and holding it across a streamed
+     * generation serialised every other daemon command behind this one — the
+     * status poll, the memory reading, a voice test, a second question. A
+     * `RequestBuilder` owns its client, so the guard is needed only to build
+     * it. */
+    let request = {
+        let daemon = state.daemon().await?;
+        daemon
+            .model_request(reqwest::Method::POST, generate::CHAT_ROUTE)
+            .json(&chat_request(model, system, question, MAX_ANSWER_TOKENS))
+    };
+    /* A SEND THAT FAILS CANCELS THE REQUEST. The webview dropped the channel —
+     * the pane closed, the reader left — and going on would keep the daemon
+     * generating into nothing, which on a loaded machine is a GPU spent on an
+     * answer nobody will read. */
+    let sink = cancel.clone();
+    /* THE TEXT, not the whole `Answer`. A generation STREAMS, so a reader
+     * watching it arrive sees it stop — see `Error::AnswerTruncated` for why
+     * that is the difference between this command and the gloss, and not a
+     * looser rule here. */
+    Ok(generate::stream(request, &cancel, move |text| {
+        if chunks.send(text).is_err() {
+            sink.trip();
+        }
+    })
+    .await?
+    .text)
+}
+
+/// Define a term in the sentence it sits in (WI-15.13).
+///
+/// A PROMISE, not a stream: two sentences streamed into a popover beside a
+/// word is jitter, not progress. And it is its own command rather than a mode
+/// of `inference_generate` because "no selection can reach an agent" is a
+/// property of the call graph — there is no branch here that could reach
+/// `agentask`, and no parameter that could ask for one.
+#[tauri::command]
+pub async fn inference_gloss<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+    request_id: String,
+    model: String,
+    system: String,
+    question: String,
+) -> Result<String> {
+    limits::within("request id", &request_id, limits::MAX_REQUEST_ID)?;
+    limits::within("system prompt", &system, limits::MAX_SYSTEM)?;
+    limits::within("question", &question, limits::MAX_QUESTION)?;
+    limits::within("model id", &model, limits::MAX_MODEL_ID)?;
+    /* RESOLVED, like `inference_generate`. The first version of the closed
+     * argument set covered only the generate path, which left two commands
+     * forwarding a caller-supplied model straight to the daemon — the exact
+     * hole the header claims does not exist. An audit caught the omission.
+     * And registered BEFORE the resolve, for generate's reason. */
+    let guard = state.requests().begin(&request_id)?;
+    let cancel = guard.cancel();
+    let model = resolve_model(&app, &state, &model, probe::Modality::Text).await?;
+    cancel.check()?;
+    /* Dropped before the wait, as in `inference_generate` — see there. */
+    let request = {
+        let daemon = state.daemon().await?;
+        daemon
+            .model_request(reqwest::Method::POST, generate::CHAT_ROUTE)
+            /* ⚠️ ITS OWN CEILING, because `MODEL_CEILING` is ten minutes and
+             * every word of its reasoning is about a 1024-token generation.
+             * A reader has stopped reading to wait for this one. See
+             * `daemon::GLOSS_CEILING`. */
+            .deadline(crate::daemon::GLOSS_CEILING)
+            .json(&chat_request(model, system, question, MAX_GLOSS_TOKENS))
+    };
+    // Streamed on the wire, delivered whole: the daemon's non-streaming path
+    // holds the whole answer before replying, and cancelling that is a
+    // request nobody is reading rather than a generation that stopped.
+    let answer = generate::stream(request, &cancel, |_| {}).await?;
+    /* ⚠️ **A CUT-OFF DEFINITION IS NOT A DEFINITION**, and this command used to
+     * return one as though it were. `MAX_GLOSS_TOKENS` is Carta's own bound, so
+     * hitting it is an ordinary outcome rather than a daemon misbehaving — and
+     * because the gloss is delivered WHOLE rather than streamed, nobody watches
+     * it stop: `glossProvider` cached the fragment and the strip drew it in
+     * amber, which is the mark that says "this is the definition". The reasoning
+     * is `generate::stream`'s own, applied to the bound it did not cover:
+     * *half an answer presented as a whole one is the shape this crate refuses
+     * everywhere else.*
+     *
+     * Refused rather than trimmed to the last full sentence: a model that ran
+     * past 160 tokens ignored a six-line prompt asking for one or two, so its
+     * first 160 are not a gloss that happens to be long. */
+    /* ⚠️ **AND `length` WAS NOT THE ONLY WAY NOT TO FINISH**, which the first
+     * version of this check missed: it refused `length` and accepted
+     * everything else, including a stream that ended saying NOTHING — a daemon
+     * killed mid-answer, a body that stopped without `[DONE]`. `generate.rs`'s
+     * own doc for `Answer::finish` says that case is "a daemon that went away
+     * mid-answer", and returning it as a definition is the same defect this
+     * check exists to close, arriving by the other door. Found by audit.
+     *
+     * So the test is POSITIVE — only an explicit `stop` is a finished answer —
+     * which is the fail-closed direction: a backend that stops reporting
+     * `finish_reason` breaks the gloss loudly instead of quietly shipping
+     * fragments in amber. */
+    if !answer.complete() {
+        return Err(Error::AnswerTruncated {
+            finish: answer.finish_label(),
+            limit: MAX_GLOSS_TOKENS,
+        });
+    }
+    Ok(answer.text)
+}
+
+/* ──────────────────────────────── the agents ────────────────────────────── */
+
+/// One tool-free, read-only turn from an agent CLI.
+#[tauri::command]
+pub async fn agent_ask<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+    request_id: String,
+    route: String,
+    prompt: String,
+    // The reader's Faster / More thorough choice, from a closed set. `None`
+    // — an older caller, or one that does not care — reads as their account
+    // default, which is the only honest reading of "not asked".
+    depth: Option<crate::agentask::Depth>,
+    chunks: Channel<String>,
+) -> Result<String> {
+    limits::within("request id", &request_id, limits::MAX_REQUEST_ID)?;
+    limits::within("prompt", &prompt, limits::MAX_AGENT_PROMPT)?;
+    limits::within("route id", &route, limits::MAX_MODEL_ID)?;
+    let which = parse_agent_route(&route)?;
+    /* REGISTERED BEFORE THE PROBE, and the probe races cancellation.
+     *
+     * `agent::probe` spawns up to two child processes with a five-second
+     * timeout each, and registration used to happen after it. A reader who
+     * pressed Stop during that window cancelled a request id nothing had
+     * begun — the cancel answered `RequestUnknown` and the turn then started
+     * anyway, on their subscription. The guard has to exist before the first
+     * slow await, not before the spawn. */
+    let guard = state.requests().begin(&request_id)?;
+    let cancel = guard.cancel();
+    let probe = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(Error::Cancelled),
+        probed = agent::probe(which) => probed,
+    };
+    if let Some(reason) = probe.unusable {
+        return Err(match reason {
+            agent::SIGNED_OUT => Error::AgentSignedOut(which.name()),
+            agent::VERSION_NOT_SUPPORTED => Error::AgentUnsupportedVersion {
+                agent: which.name(),
+                version: probe.version.map(|v| v.to_string()).unwrap_or_default(),
+            },
+            _ => Error::AgentMissing(which.name()),
+        });
+    }
+    let program = probe
+        .path
+        .ok_or_else(|| Error::AgentMissing(which.name()))?;
+
+    // An EMPTY directory, owned by Carta, as the agent's working root. Not
+    // the reader's library and not Carta's own data root: a read-only agent
+    // pointed at the library could read every book, every note and the
+    // journal.
+    let workdir = state.layout(&app)?.base.join("agent-root");
+    agentask::ask(
+        which,
+        std::path::Path::new(&program),
+        &workdir,
+        &prompt,
+        depth.unwrap_or_default(),
+        &cancel,
+        {
+            /* ⚠️ A SEND THAT FAILS CANCELS THE TURN, as it already did on the
+             * local path. The webview dropped the channel — the pane closed,
+             * the reader left — and swallowing that kept an agent CLI running
+             * to the end of its turn. On a subscription route that is not a
+             * wasted GPU cycle but a turn the reader has PAID for, spent on an
+             * answer nobody will read. */
+            let sink = cancel.clone();
+            move |text| {
+                if chunks.send(text).is_err() {
+                    sink.trip();
+                }
+            }
+        },
+    )
+    .await
+}
+
+/// Launch the vendor's own login flow.
+///
+/// Carta does not open, copy, refresh or pool the vendor's tokens — it starts
+/// their CLI's login and then re-reads status. The credential is theirs and
+/// stays theirs.
+#[tauri::command]
+pub async fn agent_sign_in(route: String) -> Result<()> {
+    limits::within("route id", &route, limits::MAX_MODEL_ID)?;
+    let which = parse_agent_route(&route)?;
+    let path = agent::which(which.exe()).ok_or_else(|| Error::AgentMissing(which.name()))?;
+    let args: &[&str] = match which {
+        Agent::Codex => &["login"],
+        Agent::Claude => &["auth", "login"],
+    };
+    // Spawned and released: a login flow opens a browser and takes as long as
+    // the reader takes. Awaiting it would block the command for minutes —
+    // but SOMETHING must wait, or the exited child sits as a zombie until
+    // Carta quits. A detached task is that something.
+    let mut child = tokio::process::Command::new(path)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    tokio::spawn(async move {
+        if let Err(err) = child.wait().await {
+            log::warn!("inference: the sign-in process could not be reaped: {err}");
+        }
+    });
+    Ok(())
+}
+
+/* ────────────────────────────── cloud endpoints ─────────────────────────── */
+
+/* Every store call below goes through `state.on_store` — the store is
+ * blocking and so is the keychain, and the seam is where that is explained. */
+
+#[tauri::command]
+pub async fn inference_endpoints<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+) -> Result<Vec<Endpoint>> {
+    state.on_store(&app, |store| store.list()).await
+}
+
+#[tauri::command]
+pub async fn inference_add_endpoint<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+    id: String,
+    label: String,
+    base_url: String,
+) -> Result<()> {
+    /* THE ID IS BOUNDED HERE AND NOT ONLY IN THE STORE. `EndpointStore::add`
+     * refuses an invalid id by copying it into `ModelUnknown`, and that error
+     * crosses IPC — so the store's grammar check is a length check that
+     * ALLOCATES AND ECHOES whatever it refuses. Bounded before the blocking
+     * hop, like the label beside it and the key in `set_endpoint_key`. */
+    limits::within("endpoint id", &id, limits::MAX_ENDPOINT_ID)?;
+    limits::within("endpoint label", &label, limits::MAX_ENDPOINT_LABEL)?;
+    limits::within("endpoint url", &base_url, limits::MAX_ENDPOINT_URL)?;
+    /* ⚠️ ONE WRITER AT A TIME. `add` and `remove` read the list, edit it and
+     * write it back through the same temporary path; nothing serialised them
+     * and `#[tauri::command]`s run concurrently, so two at once lose an edit
+     * or rename a half-written file over the reader's only copy. */
+    let _writing = state.endpoint_writes().lock().await;
+    state
+        .on_store(&app, move |store| store.add(&id, &label, &base_url))
+        .await?;
+    /* The daemon takes its keys and its provider registrations at spawn, so a
+     * running one knows nothing about this until it is restarted. */
+    state.reconfigure().await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn inference_remove_endpoint<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+    id: String,
+) -> Result<()> {
+    /* ⚠️ THIS IS THE ONE THAT NEVER REACHED A GRAMMAR CHECK. `add` and
+     * `set_key` call `valid_id`; `EndpointStore::remove` does not — it filters
+     * the list by the id and then hands it straight to the keychain as an
+     * account name. So nothing at all bounded this field, and the bound has to
+     * be here rather than borrowed from a sibling command. */
+    limits::within("endpoint id", &id, limits::MAX_ENDPOINT_ID)?;
+    let _writing = state.endpoint_writes().lock().await;
+    /* ⚠️ THE RECONFIGURE IS THE HALF THAT MATTERS, and it is unconditional.
+     * Without it a key the reader deleted stayed live in the running child's
+     * environment, with its provider still registered, until the app was next
+     * launched — and a `?` between the removal and the reconfigure put it
+     * back for exactly the case where the keychain refused to give the key
+     * up. `remove_endpoint` holds the order; see it for why. */
+    state.remove_endpoint(&app, id).await
+}
+
+/// Store an endpoint's key. WRITE-ONLY — there is deliberately no command
+/// that reads one back, and that absence is what makes WI-15.8's acceptance
+/// a property of this list rather than of anybody's discipline.
+#[tauri::command]
+pub async fn inference_set_endpoint_key<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+    id: String,
+    key: String,
+) -> Result<()> {
+    // Bounded BEFORE the blocking keychain write gets to allocate for it.
+    // Both fields: the id is the keychain ACCOUNT the key is written under.
+    limits::within("endpoint id", &id, limits::MAX_ENDPOINT_ID)?;
+    limits::within("endpoint key", &key, limits::MAX_ENDPOINT_KEY)?;
+    let _writing = state.endpoint_writes().lock().await;
+    state
+        .on_store(&app, move |store| store.set_key(&id, &key))
+        .await?;
+    // A changed key is a changed spawn environment; an empty one is a clear.
+    state.reconfigure().await;
+    Ok(())
+}
+
+/* ──────────────────────────────── narration ─────────────────────────────── */
+
+/// Synthesise speech (WI-15.9's `Test voice`).
+///
+/// The route, its one surprising field name and the cancellation are
+/// `speech.rs`'s; what is left here is the policy every command in this module
+/// is supposed to be.
+#[tauri::command]
+pub async fn inference_speak<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, InferenceState>,
+    request_id: String,
+    model: String,
+    text: String,
+    voice: Option<String>,
+) -> Result<Vec<u8>> {
+    limits::within("request id", &request_id, limits::MAX_REQUEST_ID)?;
+    limits::within("model id", &model, limits::MAX_MODEL_ID)?;
+    limits::within("speech text", &text, limits::MAX_SPEECH_TEXT)?;
+    /* THE VOICE IS A CALLER STRING TOO, and it was the one field on this
+     * command left unbounded — `speech::body` copies it into the JSON body
+     * that goes to the daemon, so an unbounded voice is an unbounded request
+     * whatever `MAX_SPEECH_TEXT` says about the text beside it. An
+     * `Option<String>` reads as "optional, therefore small"; it is neither. */
+    if let Some(voice) = voice.as_deref() {
+        limits::within("voice", voice, limits::MAX_MODEL_ID)?;
+    }
+    /* SPEECH, and this is where the modality check earns itself: without it a
+     * caller could name the text model here and the answering model in
+     * `inference_generate` could be a voice. Registered BEFORE the resolve,
+     * for generate's reason. */
+    let guard = state.requests().begin(&request_id)?;
+    let cancel = guard.cancel();
+    let model = resolve_model(&app, &state, &model, probe::Modality::Speech).await?;
+    cancel.check()?;
+    let body = speech::body(&model, &text, voice.as_deref());
+    /* Dropped before the wait, as in `inference_generate` — see there. */
+    let request = {
+        let daemon = state.daemon().await?;
+        daemon
+            .model_request(reqwest::Method::POST, speech::SPEECH_ROUTE)
+            .json(&body)
+    };
+    /* THE TRANSPORT IS `speech`'s. This command is policy — bound the input,
+    resolve the model at the right modality, take the request slot — and
+    everything after it was HTTP, which is what `commands.rs`'s own header
+    says does not live here. */
+    speech::collect(request, &cancel).await
+}
+
+/* ────────────────────────────── cancellation ────────────────────────────── */
+
+/// Cancel any streaming request by the id its caller minted.
+#[tauri::command]
+pub async fn inference_cancel(state: State<'_, InferenceState>, request_id: String) -> Result<()> {
+    limits::within("request id", &request_id, limits::MAX_REQUEST_ID)?;
+    state.requests().cancel(&request_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every accepted route id, and a sample of the rejected ones.
+    ///
+    /// One function rather than the two verbatim matches this replaces —
+    /// `agent_ask` and `agent_sign_in` each spelled it out, error conversion
+    /// included, so a third agent would have had to be added in both and a
+    /// drift between them would have been invisible.
+    #[test]
+    fn only_the_probe_s_own_agent_ids_are_accepted() {
+        assert_eq!(parse_agent_route("agent:codex").unwrap(), Agent::Codex);
+        assert_eq!(parse_agent_route("agent:claude").unwrap(), Agent::Claude);
+        /* EVERY AGENT HAS ONE. A new variant with no arm here would fail this
+        rather than silently becoming unreachable from the commands. */
+        for agent in crate::agent::AGENTS {
+            let id = crate::probe::agent_route_id(agent);
+            assert_eq!(parse_agent_route(&id).unwrap(), agent, "{id}");
+        }
+    }
+
+    /// ⚠️ NEVER A PATH, NEVER AN ARGV. The route string comes from a webview
+    /// that renders untrusted book HTML, and what it names is a program to
+    /// execute.
+    #[test]
+    fn anything_the_probe_did_not_mint_is_refused() {
+        for bad in [
+            "",
+            "codex",
+            "agent:",
+            "agent:codex ",
+            "AGENT:CODEX",
+            "/usr/local/bin/codex",
+            "agent:codex; rm -rf /",
+            "local:qwen",
+            "endpoint:proxy",
+        ] {
+            assert!(
+                matches!(parse_agent_route(bad), Err(Error::ModelUnknown(_))),
+                "{bad:?} was accepted as an agent route"
+            );
+        }
+    }
+
+    /// The row the settings section renders. `installed` and `license` are
+    /// both present, because the reader is entitled to know the terms before
+    /// a multi-gigabyte download.
+    #[test]
+    fn a_model_row_carries_its_license_and_no_source_url() {
+        let row = ModelRow {
+            id: "m".to_owned(),
+            label: "M".to_owned(),
+            modality: crate::manifest::Modality::Text,
+            license: "Apache-2.0".to_owned(),
+            bytes: 100,
+            installed: false,
+            parameters: Some("4B".to_owned()),
+            quantization: None,
+        };
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["license"], "Apache-2.0");
+        assert_eq!(json["installed"], false);
+        // The source URL is the manifest's business; a row does not carry it,
+        // so nothing in the webview can be tempted to fetch it directly.
+        assert!(json.get("source").is_none());
+        // An absent optional is omitted rather than sent as null.
+        assert!(json.get("quantization").is_none());
+    }
+
+    /// `—`, never `0`. Lemonade is specifically credited for returning null
+    /// rather than zero for memory it cannot read, and that honesty has to
+    /// survive translation.
+    #[test]
+    fn unknown_memory_is_null_and_never_zero() {
+        let usage = ResourceUsage {
+            resident_bytes: None,
+            model_loaded: None,
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert!(json["residentBytes"].is_null());
+        assert_ne!(json["residentBytes"], 0);
+    }
+
+    /// The bounds are Carta's, not the caller's. A webview asking for an
+    /// unbounded generation is a GPU pinned by book HTML.
+    /// The bounds are compile-time constants, so these are `const` assertions:
+    /// a build that widened one would fail to compile rather than failing a
+    /// test somebody could mark ignored.
+    #[test]
+    fn answer_lengths_are_bounded_here_rather_than_by_the_caller() {
+        const { assert!(MAX_ANSWER_TOKENS > 0 && MAX_ANSWER_TOKENS <= 4096) };
+        const {
+            assert!(
+                MAX_GLOSS_TOKENS < MAX_ANSWER_TOKENS,
+                "a gloss is one or two sentences and the reader is waiting beside a word"
+            )
+        };
+        const {
+            assert!(
+                TEMPERATURE <= 0.5,
+                "invention is the failure §13 exists to prevent"
+            )
+        };
+    }
+}

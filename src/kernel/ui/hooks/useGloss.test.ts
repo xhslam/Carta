@@ -1,0 +1,873 @@
+// @vitest-environment jsdom
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { act, cleanup, renderHook } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { GlossContext, GlossProvider } from '../../core/gloss'
+import { buildFixture, elem, txt, type Fixture } from '../reader/wordSnap/domFake.testkit'
+import { askGloss, glossRequest, sentenceAround, useGloss, type GlossSelection } from './useGloss'
+
+/**
+ * WHAT THE MODEL IS ACTUALLY SENT — asserted at the provider, which is the only
+ * place the whole path can be seen at once.
+ *
+ * §C3 is the reason this is a provider spy and not a unit test of
+ * `sentenceAt`. Revision 1 of the plan had `sentenceAt` return
+ * `{sentence, complete, blockTruncated}` and let the caller decide; it had no
+ * caller that could, because `GlossContext.sentence` is a bare string and
+ * `ask()` takes strings. The flags would have been computed, ignored, and the
+ * fragment sent anyway — **and every test of the extractor would still have
+ * passed.** Only a test that watches the provider can tell "it declined" from
+ * "it declined and the caller sent the fragment regardless".
+ *
+ * `domFake.testkit.ts` supplies the tree rather than jsdom, for the reason its
+ * header gives: it refuses duplicate text nodes, so walking the wrong node
+ * always changes the answer. jsdom is here only because `useGloss` is a React
+ * hook.
+ */
+
+afterEach(cleanup)
+
+/** A `Range` as `sentenceAt` reads one: four fields and nothing else. */
+function rangeOf(
+  fixture: Fixture,
+  start: readonly [string, number],
+  end: readonly [string, number],
+): Range {
+  return {
+    startContainer: fixture.text(start[0]),
+    startOffset: start[1],
+    endContainer: fixture.text(end[0]),
+    endOffset: end[1],
+  } as unknown as Range
+}
+
+function selectionOf(
+  fixture: Fixture,
+  text: string,
+  start: readonly [string, number],
+  end: readonly [string, number],
+  context: { prefix: string; suffix: string },
+): GlossSelection {
+  return { text, prefix: context.prefix, suffix: context.suffix, range: rangeOf(fixture, start, end) }
+}
+
+/** A provider that records what it was asked and answers nothing useful. */
+function spyProvider(): {
+  provider: GlossProvider
+  seen: { term: string; context: GlossContext }[]
+} {
+  const seen: { term: string; context: GlossContext }[] = []
+  return {
+    seen,
+    provider: {
+      available: true,
+      installable: true,
+      async gloss(term, context) {
+        seen.push({ term, context })
+        return 'a definition'
+      },
+    },
+  }
+}
+
+/** The whole path: the request the wiring builds, through the hook, to the
+ *  provider — so nothing between them can quietly substitute a different one. */
+async function askThrough(
+  selection: GlossSelection,
+  options: Partial<Parameters<typeof askGloss>[2]> = {},
+) {
+  const { provider, seen } = spyProvider()
+  const { result } = renderHook(() => useGloss(provider))
+  /* Through `askGloss`, the whole handler `Reader` calls — not through
+   * `glossRequest` on its own. Driving the decision function directly left the
+   * step that turns a request into a provider call untested, which an audit
+   * pointed out is most of what the wiring IS. */
+  await act(async () => {
+    askGloss(result.current, selection, {
+      fixedLayout: false,
+      bookTitle: 'Moby-Dick',
+      ...options,
+    })
+  })
+  return { seen }
+}
+
+describe('what the provider receives', () => {
+  /*
+   * The ordinary case, and the whole point of the phase: the sentence rather
+   * than a 32-character window a side. The `prefix`/`suffix` handed in are the
+   * ones `markContext` would really have stored, and they are DELIBERATELY
+   * wrong-looking — the fallback built from them starts mid-word, which is the
+   * defect being fixed.
+   */
+  it('is sent the sentence the term sits in, not the stored window', async () => {
+    const fixture = buildFixture(
+      elem('p', {}, [
+        txt('First one. The old man had taught the boy to fish and the boy loved him. Last one.'),
+      ]),
+    )
+    const whole =
+      'First one. The old man had taught the boy to fish and the boy loved him. Last one.'
+    const { seen } = await askThrough(
+      selectionOf(fixture, 'loved', [whole, 62], [whole, 67], {
+        /* Exactly what `markContext` stores: the 32 characters a side. The
+         * prefix begins mid-word, in `taught`, which is the defect. */
+        prefix: 'ght the boy to fish and the boy ',
+        suffix: ' him. Last one.',
+      }),
+    )
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.term).toBe('loved')
+    expect(seen[0]?.context.sentence).toBe(
+      'The old man had taught the boy to fish and the boy loved him.',
+    )
+  })
+
+  /*
+   * §C3, the `<br>` case. `He said,<br>and left.` produces a sentinel
+   * `Flattened` cannot tell from `</p>`, so the run ends at `He said,` — a
+   * fragment with a comma on it, which a model would answer about confidently.
+   * The extractor declines and the provider must receive THE FALLBACK, not a
+   * non-null incomplete result.
+   */
+  it('is sent the fallback when a <br> cut the sentence, never the fragment', async () => {
+    const fixture = buildFixture(elem('p', {}, [txt('He said,'), elem('br', {}), txt('and left.')]))
+    const selection = selectionOf(fixture, 'said', ['He said,', 3], ['He said,', 7], {
+      prefix: 'He ',
+      suffix: ', and left.',
+    })
+
+    const { seen } = await askThrough(selection)
+
+    expect(seen[0]?.context.sentence).toBe(sentenceAround('He ', 'said', ', and left.'))
+    expect(seen[0]?.context.sentence).toBe('He said, and left.')
+    /* And specifically NOT the fragment the run ends at. */
+    expect(seen[0]?.context.sentence).not.toBe('He said,')
+  })
+
+  /*
+   * §C3 again, across two blocks. The end anchor is in the second paragraph, so
+   * nothing in the first one's run can say where the selection stops.
+   */
+  it('is sent the fallback for a selection spanning two blocks', async () => {
+    const fixture = buildFixture(
+      elem('div', {}, [
+        elem('p', {}, [txt('Alpha one. Beta two. Gamma three.')]),
+        elem('p', {}, [txt('Delta four. Epsilon five. Zeta six.')]),
+      ]),
+    )
+    const selection: GlossSelection = {
+      text: 'two',
+      prefix: 'Alpha one. Beta ',
+      suffix: '. Gamma three.',
+      range: rangeOf(fixture, ['Alpha one. Beta two. Gamma three.', 16], [
+        'Delta four. Epsilon five. Zeta six.',
+        17,
+      ]),
+    }
+
+    const { seen } = await askThrough(selection)
+
+    expect(seen[0]?.context.sentence).toBe(sentenceAround(selection.prefix, 'two', selection.suffix))
+  })
+
+  /*
+   * §B1, AND THIS MUST PASS AT THE WIRING COMMIT — which is why the filters
+   * landed before it. Per-character ruby is standard, and `flatten` interleaves
+   * the readings: `<ruby>漢<rt>かん</rt>字<rt>じ</rt></ruby>` comes out as
+   * `漢かん字`. Sending the raw selection would ask the model to define a word
+   * the book does not contain, in a sentence that does not contain it either.
+   */
+  it('is sent a ruby term and sentence that both read exactly 漢字', async () => {
+    const fixture = buildFixture(
+      elem('p', {}, [
+        txt('前の文です。'),
+        elem('ruby', { display: 'ruby' }, [
+          txt('漢'),
+          elem('rt', { display: 'ruby-text' }, [txt('かん')]),
+          txt('字'),
+          elem('rt', { display: 'ruby-text' }, [txt('じ')]),
+        ]),
+        txt('は難しい。次の文です。'),
+      ]),
+    )
+    /* What the selection itself says, readings and all — the string a caller
+     * sending `selection.text` would have used. */
+    const selection = selectionOf(fixture, '漢かん字', ['漢', 0], ['字', 1], {
+      prefix: '前の文です。',
+      suffix: 'は難しい。',
+    })
+
+    const { seen } = await askThrough(selection)
+
+    expect(seen[0]?.term).toBe('漢字')
+    expect(seen[0]?.context.sentence).toBe('漢字は難しい。')
+    expect(seen[0]?.context.sentence).toContain(seen[0]?.term ?? '')
+    expect(seen[0]?.term).not.toContain('かん')
+    expect(seen[0]?.context.sentence).not.toContain('かん')
+  })
+
+  /*
+   * WI-16.4's own condition. A fixed-layout book takes the fallback until
+   * WI-16.5 measures a PDF and a pre-paginated EPUB SEPARATELY — `fixedLayout`
+   * covers both and one cannot justify enabling the other. The pair is asserted
+   * together, so a flag wired to nothing fails here.
+   */
+  it('is sent the fallback for a fixed-layout book, and the sentence otherwise', async () => {
+    const whole =
+      'First one. The old man had taught the boy to fish and the boy loved him. Last one.'
+    const fixture = buildFixture(elem('p', {}, [txt(whole)]))
+    const selection = selectionOf(fixture, 'loved', [whole, 62], [whole, 67], {
+      prefix: 'ght the boy to fish and the boy ',
+      suffix: ' him. Last one.',
+    })
+
+    const fixed = await askThrough(selection, { fixedLayout: true })
+    const reflowable = await askThrough(selection, { fixedLayout: false })
+
+    /* The window, starting mid-`taught` — which is the point: the flag is
+     * wired to something a reader could see, not to a value that happens to
+     * match. */
+    expect(fixed.seen[0]?.context.sentence).toBe(
+      'ght the boy to fish and the boy loved him.',
+    )
+    expect(reflowable.seen[0]?.context.sentence).toBe(
+      'The old man had taught the boy to fish and the boy loved him.',
+    )
+  })
+})
+
+describe('whether the sentence path fires', () => {
+  /*
+   * §F4. Counted, never shown: after this phase some lookups use a real
+   * sentence and some fall back, and a build where EVERY lookup falls back
+   * looks identical to a working one from the outside.
+   *
+   * The reason is a closed enum word — never the sentence, the term, or any
+   * book text. That is asserted here rather than trusted to `Diagnostics`'
+   * redaction, because `outcome` and `gap` are not keys the redactor covers.
+   */
+  it('records the outcome without recording any of the book', () => {
+    const fixture = buildFixture(elem('p', {}, [txt('Alpha one. Beta two. Gamma three.')]))
+    const whole = 'Alpha one. Beta two. Gamma three.'
+    const selection = selectionOf(fixture, 'two', [whole, 16], [whole, 19], {
+      prefix: 'Alpha one. Beta ',
+      suffix: '. Gamma three.',
+    })
+    const info = vi.fn()
+    const diagnostics = { info } as never
+
+    glossRequest(selection, { diagnostics })
+    glossRequest(selection, { diagnostics, fixedLayout: true })
+    glossRequest(
+      selectionOf(fixture, 'Alpha', [whole, 0], [whole, 5], { prefix: '', suffix: ' one.' }),
+      { diagnostics },
+    )
+
+    expect(info.mock.calls).toEqual([
+      ['gloss.sentence', { outcome: 'used' }],
+      ['gloss.sentence', { outcome: 'fallback', gap: 'fixed-layout' }],
+      ['gloss.sentence', { outcome: 'fallback', gap: 'run-start' }],
+    ])
+    const written = JSON.stringify(info.mock.calls)
+    expect(written).not.toContain('Beta')
+    expect(written).not.toContain('Alpha')
+  })
+})
+
+describe('the handler itself', () => {
+  /* Nothing to look up. The guard is in the handler rather than at each call
+   * site, so a caller cannot forget it. */
+  it('does nothing at all with no selection', async () => {
+    const { provider, seen } = spyProvider()
+    const { result } = renderHook(() => useGloss(provider))
+
+    await act(async () => {
+      askGloss(result.current, null, { fixedLayout: false, bookTitle: 'Moby-Dick' })
+    })
+
+    expect(seen).toEqual([])
+  })
+
+  /*
+   * The FIELD-level mutation, closed by the type rather than by a case: a
+   * caller that omitted `fixedLayout` would silently start walking PDFs, where
+   * a run is one visual line and the walk can vouch for nothing (§16.5). It is
+   * required in `AskGlossOptions`, so that omission does not compile. Asserted
+   * here as a fact about the contract, since a compile error leaves no runtime
+   * trace for a reader of this file to find.
+   */
+  it('requires the caller to say whether the book is fixed-layout', () => {
+    const options: Parameters<typeof askGloss>[2] = { fixedLayout: false, bookTitle: '' }
+
+    expect(Object.keys(options)).toContain('fixedLayout')
+    // @ts-expect-error — omitting it is the mutation this refuses.
+    const dropped: Parameters<typeof askGloss>[2] = { bookTitle: '' }
+    expect(dropped).toBeDefined()
+  })
+
+  it('carries the book title through to the provider', async () => {
+    const fixture = buildFixture(elem('p', {}, [txt('Alpha one. Beta two. Gamma three.')]))
+    const whole = 'Alpha one. Beta two. Gamma three.'
+    const { provider, seen } = spyProvider()
+    const { result } = renderHook(() => useGloss(provider))
+
+    await act(async () => {
+      askGloss(
+        result.current,
+        selectionOf(fixture, 'two', [whole, 16], [whole, 19], { prefix: '', suffix: '' }),
+        { fixedLayout: false, bookTitle: 'Moby-Dick' },
+      )
+    })
+
+    expect(seen[0]?.context.bookTitle).toBe('Moby-Dick')
+  })
+
+  /*
+   * §E6 reaches the counter too. `Diagnostics` carries no no-throw contract —
+   * the default writes nothing, but a sink the composition root chose is
+   * ordinary code — and the recording call sits outside `sentenceAt`'s own
+   * try. A throwing sink therefore took the reader's lookup down with it: no
+   * gloss, no fallback, nothing.
+   */
+  it('still reaches the provider when the diagnostics sink throws', async () => {
+    const fixture = buildFixture(elem('p', {}, [txt('Alpha one. Beta two. Gamma three.')]))
+    const whole = 'Alpha one. Beta two. Gamma three.'
+    const exploding = {
+      info: () => {
+        throw new Error('the sink is broken')
+      },
+      error: () => {
+        throw new Error('the sink is broken')
+      },
+    } as never
+
+    /* Both branches: the one that goes through `sentenceAt`, and the one where
+     * the caller reports the fixed-layout skip itself. */
+    const walked = await askThrough(
+      selectionOf(fixture, 'two', [whole, 16], [whole, 19], {
+        prefix: 'Alpha one. Beta ',
+        suffix: '. Gamma three.',
+      }),
+      { diagnostics: exploding },
+    )
+    const skipped = await askThrough(
+      selectionOf(fixture, 'two', [whole, 16], [whole, 19], {
+        prefix: 'Alpha one. Beta ',
+        suffix: '. Gamma three.',
+      }),
+      { diagnostics: exploding, fixedLayout: true },
+    )
+
+    expect(walked.seen[0]?.context.sentence).toBe('Beta two.')
+    expect(skipped.seen[0]?.context.sentence).toBe('Beta two.')
+  })
+})
+
+/**
+ * ⚠️ **THE PRESS THAT USED TO DO NOTHING.**
+ *
+ * `ask` began `if (!provider.available) return`, and while Dictionary.app sat
+ * behind the gesture that was harmless — the lookup went to the system
+ * dictionary and the gloss simply did not contribute. The hand-off is deleted,
+ * so a silent return is a dictionary button that does nothing at all on a
+ * fresh desktop, with nothing on screen to say why.
+ *
+ * These cases are what make the difference between the two behaviours
+ * observable. Without them the silent return is indistinguishable from the
+ * state below in any test that only watches the provider.
+ */
+describe('with no model installed', () => {
+  const nothing: GlossProvider = {
+    available: false,
+    /* TRUE, because the case worth pinning is the desktop one: `inference` is
+       composed, the Local models pane exists, and only the download is
+       missing.
+       ⚠️ THIS USED TO SAY "the hook does not read this field — the reader UI
+       does". It does now, and that is the fix: the reader UI reads it when the
+       BUTTON IS DRAWN and this state is reached when it is PRESSED, so a model
+       uninstalled in between offered a download into a runtime that was not
+       there. See the `installable` case below. */
+    installable: true,
+    async gloss() {
+      throw new Error('the hook must not call a provider that says it cannot answer')
+    },
+  }
+
+  it('says so, rather than returning silently', () => {
+    const { result } = renderHook(() => useGloss(nothing))
+
+    act(() => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam is a meeting.' }), 'gam', 'Moby-Dick')
+    })
+
+    expect(result.current.state).toEqual({ kind: 'unavailable', term: 'gam', installable: true })
+  })
+
+  /* NOT `failed`, and the distinction is the reader's not the maintainer's:
+     one says something went wrong and the other says something is missing.
+     Rendering them the same way would tell a reader on a fresh install that
+     Carta is broken. */
+  it('is not reported as a failure', () => {
+    const { result } = renderHook(() => useGloss(nothing))
+
+    act(() => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam is a meeting.' }), 'gam', 'Moby-Dick')
+    })
+
+    expect(result.current.state.kind).not.toBe('failed')
+  })
+
+  /* The provider's own contract is that `gloss` THROWS when it cannot answer
+     — `NO_GLOSS` says so in capitals — so a hook that called it anyway would
+     turn every press into an unhandled rejection. The fake above throws with a
+     message naming this, so the failure is legible if it ever regresses. */
+  it('does not call a provider that has already said it cannot answer', () => {
+    const { result } = renderHook(() => useGloss(nothing))
+
+    act(() => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam is a meeting.' }), 'gam', 'Moby-Dick')
+    })
+
+    expect(result.current.state.kind).toBe('unavailable')
+  })
+
+  /*
+   * ⚠️ **AND IT DOES NOT WALK THE DOCUMENT ON THE WAY**, which is about the
+   * §F4 counter rather than about cycles.
+   *
+   * `glossRequest` records `gloss.sentence` with its outcome, and that counter
+   * exists because "a build where every lookup silently falls back looks
+   * identical to a working one". The dictionary button now fires on machines
+   * with NO model, where it can only produce the install prompt — so walking
+   * there would file a sample per press for a lookup that never happened. On a
+   * machine with no model that is EVERY sample, and the one instrument that
+   * can answer "is the walk working" would be reading pure noise.
+   */
+  it('files no sentence diagnostic, because no lookup happened', () => {
+    const fixture = buildFixture(elem('p', {}, [txt('Alpha one. Beta two. Gamma three.')]))
+    const whole = 'Alpha one. Beta two. Gamma three.'
+    const info = vi.fn()
+    const { result } = renderHook(() => useGloss(nothing))
+
+    act(() => {
+      askGloss(
+        result.current,
+        selectionOf(fixture, 'two', [whole, 16], [whole, 19], {
+          prefix: 'Alpha one. Beta ',
+          suffix: '. Gamma three.',
+        }),
+        { fixedLayout: false, bookTitle: 'Moby-Dick', diagnostics: { info } as never },
+      )
+    })
+
+    expect(info).not.toHaveBeenCalled()
+    /* Non-vacuity: the press really did reach the hook, so the silence above
+       is "did not walk" rather than "did nothing at all" — which is the
+       failure this whole state exists to end. It names the RAW selection,
+       because the sentence-spelled term is what the skipped walk produces. */
+    expect(result.current.state).toEqual({ kind: 'unavailable', term: 'two', installable: true })
+  })
+
+  /* And it is dismissable, like every other thing the strip shows. A state the
+     reader cannot put away is a state that outstays the question. */
+  it('is dismissed like any other', () => {
+    const { result } = renderHook(() => useGloss(nothing))
+
+    act(() => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam is a meeting.' }), 'gam', 'Moby-Dick')
+    })
+    act(() => {
+      result.current.dismiss()
+    })
+
+    expect(result.current.state).toEqual({ kind: 'idle' })
+  })
+})
+
+/**
+ * ⚠️ **THE OTHER PRESS THAT USED TO DO NOTHING**, and it outlived the fix for
+ * its twin above by a whole phase.
+ *
+ * `lookUpPress` held the term bound and `return`ed on a term it refused: the
+ * button was drawn, the press was accepted, and there was no state, no message
+ * and no diagnostic. A reader who selected a paragraph could not tell a refusal
+ * from a broken feature. The bound now lives in `ask`, where the answer to it
+ * can be something the reader reads.
+ */
+describe('with a passage rather than a term', () => {
+  const model: GlossProvider = {
+    available: true,
+    installable: true,
+    async gloss() {
+      throw new Error('a passage must not reach the provider')
+    },
+  }
+
+  it('says so, rather than returning silently', () => {
+    const { result } = renderHook(() => useGloss(model))
+
+    act(() => {
+      result.current.ask(
+        () => ({ term: 'x', sentence: 'x' }),
+        'a'.repeat(121),
+        'Moby-Dick',
+      )
+    })
+
+    expect(result.current.state).toEqual({ kind: 'tooLong' })
+  })
+
+  /* THE WALK NEVER RUNS. `request` is the thunk that flattens the document —
+     the whole reason it is deferred — and a passage that will not be sent must
+     not pay for one, nor file a `gloss.sentence` sample for a lookup that did
+     not happen (§F4). */
+  it('does not build the request it is not going to send', () => {
+    const { result } = renderHook(() => useGloss(model))
+    const request = vi.fn(() => ({ term: 'x', sentence: 'x' }))
+
+    act(() => {
+      result.current.ask(request, 'a'.repeat(121), 'Moby-Dick')
+    })
+
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  /* AHEAD OF `available`, because it is a fact about what the READER chose and
+     is true whether or not a model exists. "Carta needs a language model to
+     define <a chapter>" is the wrong sentence twice over. */
+  it('is decided before the model is, so the message is about the gesture', () => {
+    const nothingInstalled: GlossProvider = {
+      available: false,
+      installable: true,
+      async gloss() {
+        throw new Error('unreachable')
+      },
+    }
+    const { result } = renderHook(() => useGloss(nothingInstalled))
+
+    act(() => {
+      result.current.ask(() => ({ term: 'x', sentence: 'x' }), 'a'.repeat(121), 'Moby-Dick')
+    })
+
+    expect(result.current.state.kind).toBe('tooLong')
+  })
+
+  /* AN EMPTY SELECTION IS THE ONE THING WITH NOTHING TO SAY, which is why
+     `termVerdict` has three answers rather than two: there is no passage to
+     refuse and no message to write about one, so the state is left alone
+     rather than a report being invented for it. */
+  it('leaves the state alone for an empty selection', () => {
+    const { result } = renderHook(() => useGloss(model))
+
+    act(() => {
+      result.current.ask(() => ({ term: 'x', sentence: 'x' }), '   \n ', 'Moby-Dick')
+    })
+
+    expect(result.current.state).toEqual({ kind: 'idle' })
+  })
+
+  /* IT REPLACES AN ANSWER ON SCREEN. A reader looking at a definition who then
+     selects a paragraph and presses Look up must not be left reading the
+     previous word's gloss as though it answered the new gesture. */
+  it('replaces a definition already on screen', async () => {
+    const { result } = renderHook(() => useGloss(model))
+
+    await act(async () => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam is a meeting.' }), 'gam', 'Moby')
+    })
+    act(() => {
+      result.current.ask(() => ({ term: 'x', sentence: 'x' }), 'a'.repeat(121), 'Moby')
+    })
+
+    expect(result.current.state).toEqual({ kind: 'tooLong' })
+  })
+})
+
+/**
+ * ⚠️ **`installable` IS READ AT THE PRESS, AND IT USED TO BE READ ONLY AT THE
+ * DRAW.**
+ *
+ * `decideLookUp` asks the provider when the button is created; this state is
+ * reached when the button is pressed. A model uninstalled between the two
+ * arrives here from a button drawn as `gloss`, and `Reader` passed the strip
+ * `onInstall` unconditionally on the argument that it could not — so the strip
+ * offered a 2.5 GB download into a runtime that is not there, which is the
+ * WI-20.21 failure `GlossProvider.installable` exists to prevent.
+ */
+describe('what an unavailable press records about installing', () => {
+  function providerWith(installable: boolean): GlossProvider {
+    return {
+      available: false,
+      installable,
+      async gloss() {
+        throw new Error('unreachable')
+      },
+    }
+  }
+
+  it.each([true, false])('carries the provider’s answer of %s', (installable) => {
+    const { result } = renderHook(() => useGloss(providerWith(installable)))
+
+    act(() => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam.' }), 'gam', 'Moby-Dick')
+    })
+
+    expect(result.current.state).toEqual({ kind: 'unavailable', term: 'gam', installable })
+  })
+
+  /* THE WINDOW ITSELF: the button was drawn while a model was installed, and
+     the press lands after it is gone and the runtime with it. Read at the draw,
+     this would have said `true`. */
+  it('reads it at the press, not at the render that drew the button', () => {
+    const live = { available: true, installable: true }
+    const provider: GlossProvider = {
+      get available() {
+        return live.available
+      },
+      get installable() {
+        return live.installable
+      },
+      async gloss() {
+        throw new Error('unreachable')
+      },
+    }
+    const { result } = renderHook(() => useGloss(provider))
+
+    live.available = false
+    live.installable = false
+    act(() => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam.' }), 'gam', 'Moby-Dick')
+    })
+
+    expect(result.current.state).toEqual({ kind: 'unavailable', term: 'gam', installable: false })
+  })
+})
+
+/**
+ * ⚠️ **A GLOSS DOES NOT OUTLIVE THE PASSAGE IT DESCRIBES**, and it used to.
+ *
+ * `dismiss` had exactly one caller — the strip's own × — so an amber definition
+ * survived a page turn, a chapter change, opening another book and a trip to
+ * the library. Every surface beside it is taken down on those events with the
+ * reasoning written out; this one, the one drawing MACHINE-WRITTEN text in the
+ * reader's own page, had no teardown at all.
+ *
+ * Driven here rather than in `Reader`, which takes sixteen props and renders
+ * foliate — the same argument that put `lookUpPress` and `askGloss` in files of
+ * their own.
+ */
+describe('when the passage stops being shown', () => {
+  const model: GlossProvider = {
+    available: true,
+    installable: true,
+    async gloss() {
+      return 'a meeting between whaling ships'
+    },
+  }
+
+  it('takes the definition down when the anchor moves', async () => {
+    const { result, rerender } = renderHook(({ at }: { at: string | null }) => useGloss(model, at), {
+      initialProps: { at: 'book-1|3|ch3.xhtml' },
+    })
+    await act(async () => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam.' }), 'gam', 'Moby-Dick')
+    })
+    expect(result.current.state.kind).toBe('ready')
+
+    rerender({ at: 'book-1|4|ch4.xhtml' })
+
+    expect(result.current.state).toEqual({ kind: 'idle' })
+  })
+
+  /* `null` IS "NOWHERE", which is what `Reader` passes while `inert` — the
+     reader is under the library and the book is not on screen. `inert` already
+     clears the selection for this reason and the gloss was what it did not
+     reach. */
+  it('takes it down when there is no anchor at all', async () => {
+    const { result, rerender } = renderHook(({ at }: { at: string | null }) => useGloss(model, at), {
+      initialProps: { at: 'book-1|3|ch3.xhtml' as string | null },
+    })
+    await act(async () => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam.' }), 'gam', 'Moby-Dick')
+    })
+
+    rerender({ at: null })
+
+    expect(result.current.state).toEqual({ kind: 'idle' })
+  })
+
+  /* AND THE REQUEST IN FLIGHT GOES WITH IT. A gloss asked for just before a
+     page turn used to land on the next page and render; worse, the daemon kept
+     generating for a reader who had gone. `dismiss` aborts, which is what
+     `glossProvider` turns into a cancel. */
+  it('aborts a lookup still in flight', () => {
+    let signalled: AbortSignal | null = null
+    const slow: GlossProvider = {
+      available: true,
+      installable: true,
+      gloss(_term, _context, signal) {
+        signalled = signal
+        return new Promise<string>(() => {})
+      },
+    }
+    const { result, rerender } = renderHook(({ at }: { at: string | null }) => useGloss(slow, at), {
+      initialProps: { at: 'book-1|3|ch3.xhtml' },
+    })
+    act(() => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam.' }), 'gam', 'Moby-Dick')
+    })
+    expect(result.current.state.kind).toBe('asking')
+
+    rerender({ at: 'book-2|0|ch1.xhtml' })
+
+    expect(signalled).not.toBeNull()
+    expect((signalled as unknown as AbortSignal).aborted).toBe(true)
+  })
+
+  /* NON-VACUITY. A hook that dismissed on every render would pass all three
+     above and destroy the feature — the gloss would never survive its own
+     arrival. An unchanged anchor must leave it standing. */
+  it('leaves it standing while the anchor holds', async () => {
+    const { result, rerender } = renderHook(({ at }: { at: string | null }) => useGloss(model, at), {
+      initialProps: { at: 'book-1|3|ch3.xhtml' },
+    })
+    await act(async () => {
+      result.current.ask(() => ({ term: 'gam', sentence: 'A gam.' }), 'gam', 'Moby-Dick')
+    })
+
+    rerender({ at: 'book-1|3|ch3.xhtml' })
+
+    expect(result.current.state).toMatchObject({ kind: 'ready', term: 'gam' })
+  })
+})
+
+/**
+ * ⚠️ **THE FALLBACK'S OWN SEGMENTATION, WHICH USED TO BE A SECOND POLICY AND
+ * WAS MEASURED WRONG TWICE.**
+ *
+ * `/(?<=[.!?。！？])\s+/` is a NO-OP on Chinese — the lookbehind lists the CJK
+ * terminators but the pattern still demands a space after them, and Chinese
+ * does not write one — and an abbreviation before the term erased the entire
+ * prefix. Phase 16 measured both and deliberately left them, because its own
+ * claim was that the fallback was unchanged. It goes through `sentenceOf` now,
+ * with §C1's gate off: one policy, two tolerances.
+ *
+ * These cases are the exact strings phase 16 recorded as broken.
+ */
+describe('the fallback sentence', () => {
+  /* THE ONE THAT MATTERED MOST. A fixed-layout book never reaches the walk
+     (WI-16.5), so for a Chinese PDF this was not an edge case — it was the
+     whole feature, sending the raw 32-character window every time. */
+  it('splits Chinese, which the regex could not', () => {
+    expect(sentenceAround('他说。然后走了。今天的', '天气', '很好。明天呢？')).toBe('今天的天气很好。')
+  })
+
+  /* `'He met Mr. '.split(…).pop()` was `''`, so the model was told the term
+     began the sentence. `sentenceOf`'s bounded merge keeps the title with the
+     name after it. */
+  it('keeps the prefix across an abbreviation, which the regex erased', () => {
+    expect(sentenceAround('He met Mr. ', 'Smith', ' at noon. Then left.')).toBe(
+      'He met Mr. Smith at noon.',
+    )
+  })
+
+  it('takes the sentence the term sits in out of an ordinary window', () => {
+    expect(sentenceAround('First one. The old man ', 'loved', ' him. Last one.')).toBe(
+      'The old man loved him.',
+    )
+  })
+
+  /* NO WORSE THAN THE WINDOW IT WAS GIVEN, and this is the defect the WALK was
+     built to fix rather than one this can. `markContext` stores 32 characters a
+     side for RE-ANCHORING, so the window starts mid-word — `"ght the boy"`, cut
+     out of `taught` — and no segmenter can put back a head that was never
+     there. The head is kept exactly as the regex kept it. */
+  it('cannot recover a window that was already cut mid-word', () => {
+    expect(sentenceAround('ght the boy to fish and the boy ', 'loved', ' him. Last one.')).toBe(
+      'ght the boy to fish and the boy loved him.',
+    )
+  })
+
+  /* And with genuinely no boundary anywhere, the whole window — which is what
+     the regex produced on every input it failed on. */
+  it('returns the whole window when it holds no boundary at all', () => {
+    expect(sentenceAround('the boy to fish and the boy ', 'loved', ' him and the sea')).toBe(
+      'the boy to fish and the boy loved him and the sea',
+    )
+  })
+
+  /* A selection with no context either side is its own sentence — better than
+     an empty string, which would ask the model to define a word in a vacuum. */
+  it('is its own sentence with no context either side', () => {
+    expect(sentenceAround('', 'gam', '')).toBe('gam')
+    expect(sentenceAround('  ', '  ', '  ')).toBe('  ')
+  })
+
+  /* §C1 IS OFF HERE AND ONLY HERE. The window is cut mid-sentence by
+     construction, so `sentenceAt`'s rule — a boundary at the run's edge is not
+     evidence of a sentence ending — would decline every single call and leave
+     this with nothing to answer. Non-vacuity for `requireComplete`: with the
+     gate on, this input has no interior boundary before the term and would be
+     refused. */
+  it('answers where the walk would decline', () => {
+    expect(sentenceAround('old man ', 'loved', ' him. Last')).toBe('old man loved him.')
+  })
+
+  /* THE LOCALE IS A NICETY, NOT A REQUIREMENT, and that is measured: ICU
+     segments `。` the same under every locale tag, so a Chinese PDF stamped
+     `lang="en"` by `makePdf` still splits correctly. What the locale changes is
+     the Latin abbreviation merge, which is gated by script. */
+  it('splits Chinese under an English locale, which is what a PDF declares', () => {
+    expect(
+      sentenceAround('他说。然后走了。今天的', '天气', '很好。明天呢？', { locale: 'en' }),
+    ).toBe('今天的天气很好。')
+  })
+})
+
+describe('what the lookup path costs', () => {
+  /*
+   * §E3. The walk is on the GESTURE and nowhere else. `publish()` runs on every
+   * `selectionchange`, so a second flatten there would be a walk of the
+   * document per pointer move while a reader drags a selection.
+   *
+   * Asserted structurally, because the cheap version — "it is only called from
+   * the Look up handler" — is a claim about a file and can be checked as one.
+   * A timing assertion here would be flaky and would prove less.
+   */
+  it('never reaches the selection publish path', () => {
+    /* Resolved from the repository root rather than from `import.meta.url`:
+     * this file opts into jsdom for the hook, and there `import.meta.url` is an
+     * http URL that `fileURLToPath` refuses. `readFileSync` throws if either
+     * path is wrong, so a moved file fails loudly instead of scanning nothing. */
+    const session = readFileSync(resolve('src/kernel/ui/reader/session.ts'), 'utf8')
+    const reader = readFileSync(resolve('src/kernel/ui/screens/Reader.tsx'), 'utf8')
+
+    expect(session).not.toMatch(/sentenceAt|glossRequest|askGloss/)
+    /* Non-vacuity: the session really is the module that publishes selections,
+     * so its silence above means the walk is absent rather than that the file
+     * moved. */
+    expect(session).toContain('onSelection')
+    /* And the gesture really does reach it. A source assertion, and a weak one
+     * — an audit pointed out that a differently named helper called from
+     * `publish()` would survive the scan above. The honest instrument is a
+     * dependency-cruiser `reachable` rule over the whole call graph, which is a
+     * change to the boundary system rather than to this phase. Recorded under
+     * "What the audit rounds found" in `dev-docs/plans/phase-16-the-sentence.md`
+     * rather than implied away.
+     *
+     * ⚠️ IT USED TO CARRY MORE WEIGHT THAN THIS. The scan was also the only
+     * thing standing behind `Reader`'s lookup DECISION — whether a control is
+     * drawn, whether the term is worth sending, what to run. Whether a control
+     * is drawn moved to `lookUpPress` in `ui/lookUp.ts`, where `lookUp.test.ts`
+     * RUNS it including the case a scan could never see: an action compared
+     * against a value it cannot hold. Whether the term is worth sending moved
+     * HERE, to `ask` — see "with a passage rather than a term" — because the
+     * answer to a refusal is a state, and a guard that only `return`ed was the
+     * silence this whole file exists to keep out. What is left in this case is
+     * the narrow claim that the reader still calls the handler. */
+    expect(reader).toContain('askGloss(gloss, selection')
+  })
+})

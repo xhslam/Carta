@@ -1,0 +1,457 @@
+import { spawnSync } from 'node:child_process'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { Script } from 'node:vm'
+import { describe, expect, it } from 'vitest'
+import { CORPUS } from '../src/kernel/ui/reader/wordSnap/corpus.ts'
+import { evaluateSnippet } from './word-snap-parity.mjs'
+import { CHECKS, assertRan, buildDomSnippet } from './word-snap-live.mjs'
+
+/**
+ * The guards on WI-12's live lane — and they live HERE, in the lane that
+ * always runs, on purpose.
+ *
+ * EXCEPT THAT ONE SUITE BELOW DOES NOT ALWAYS RUN, and the sentence above was
+ * read as though it did. `describe.skipIf(noConfig)` gates the first suite on
+ * `.claude/tdd-guardian/config.json`, which `.gitignore` excludes — so those
+ * three cases collect on a developer's machine and are skipped on every clean
+ * checkout. Written into `tests/ledger.json` by a `--write` run on a machine
+ * that had the file, they then read as GONE to CI, to a fresh clone, and to
+ * `verify:without`'s temp copy. That is what turned `main` red on 2026-08-21,
+ * eight steps into `pnpm verify`, with no code change behind it.
+ *
+ * **The ledger is now written as a CLEAN CHECKOUT sees it**, so those three
+ * are absent from it. A machine that has the config collects three more than
+ * the ledger records, and additions are free and silent by design — so it is
+ * green in both places, and a genuine deletion is still caught in both.
+ *
+ * The rule that generalises, and it is not only about this file: **anything
+ * conditional on an untracked path must not reach the ledger.** If these
+ * guards should genuinely always run, the fix is to stop gating them on a file
+ * the repository does not contain — not to re-record them.
+ *
+ * The live lane needs a running app, a WebKit bridge and a human. A guard
+ * against a silently empty live run is worthless if it only runs in the lane
+ * being guarded: that is the same class of defect as `actool` and
+ * `screencapture` exiting 0 having written nothing, which this repository has
+ * been bitten by twice (`AGENTS.md`).
+ *
+ * So the cases below check two things the unit lane genuinely can check:
+ *
+ * 1. **the lane is configured as specified** — `gateOn: ["manual"]`,
+ *    `coverage: "none"`, and a probe that runs without the app;
+ * 2. **the runner fails closed** — an unreachable bridge and a zero-row corpus
+ *    both exit non-zero, and the snippet reports failure rather than success in
+ *    an engine with no DOM.
+ *
+ * **Nothing here verifies a gesture, and nothing here claims a live run
+ * happened.** The Tauri MCP bridge dispatches `isTrusted: false` events, which
+ * produce no native selection and no `selectionchange`; no harness at any level
+ * reaches a drag, a double-click, a long-press or a pen.
+ *
+ * **The manual gesture record is no longer in this repository.** It was
+ * The manual selection checklist, and seven cases here asserted it
+ * named every unautomatable gesture, pinned its environment with no
+ * placeholders, and declared an honest run status. It was removed from the
+ * history deliberately; those seven assertions went with it, and this file no
+ * longer has any way to tell whether the manual lane is documented at all.
+ * That cover is gone rather than relocated — if it is wanted back, the
+ * checklist has to return to a tracked path first.
+ */
+
+const ROOT = new URL('../', import.meta.url)
+const SCRIPT = fileURLToPath(new URL('./word-snap-live.mjs', import.meta.url))
+const CONFIG = fileURLToPath(new URL('.claude/tdd-guardian/config.json', ROOT))
+
+/** The script, as a user would run it. `status`, not a throw: every exit-code
+ *  case below is one where a non-zero exit is the point. */
+function run(args) {
+  const result = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: 'utf8' })
+  return { code: result.status, out: result.stdout ?? '', err: result.stderr ?? '' }
+}
+
+function tempFile(name, contents) {
+  const dir = mkdtempSync(join(tmpdir(), 'word-snap-live-'))
+  const path = join(dir, name)
+  writeFileSync(path, contents, 'utf8')
+  return path
+}
+
+/** A port nothing is listening on, found by binding one and letting it go.
+ *  Racy in principle, immediate in practice — and a port that DID answer would
+ *  fail the assertion loudly rather than pass it. */
+function closedPort() {
+  return new Promise((resolve, reject) => {
+    const server = createServer()
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address()
+      server.close(() => resolve(port))
+    })
+  })
+}
+
+/**
+ * The workspace's tdd-guardian config, when this checkout has one.
+ *
+ * `.gitignore` puts the whole of `.claude/` outside version control — this
+ * repository runs cc-suite in PRIVATE mode — so a fresh clone genuinely has no
+ * config to assert against, and a test that read it unconditionally would be
+ * red for everyone but the machine that ran `/tdd-guardian:init`.
+ *
+ * Absent, the four lane cases below are **skipped and say so in their names**,
+ * never quietly passed.
+ */
+const config = existsSync(CONFIG) ? JSON.parse(readFileSync(CONFIG, 'utf8')) : null
+const noConfig = config === null
+
+describe.skipIf(noConfig)('the live lane (skipped when this checkout has no .claude/tdd-guardian/config.json)', () => {
+  /*
+   * `gateOn: ["manual"]` is the whole point: the lane needs `pnpm tauri dev`
+   * running and a human at the machine. On `taskCompleted` it would stall every
+   * task on a bridge that is usually not there; on `commit` it would block
+   * every commit made without the app up.
+   */
+  it('exists, is manual-only, and carries a probe that runs without the app', () => {
+    const live = config.lanes.find((lane) => lane.name === 'live')
+
+    expect(live).toBeDefined()
+    expect(live.gateOn).toEqual(['manual'])
+    expect(live.coverage).toBe('none')
+    expect(live.command.trim()).not.toBe('')
+    expect(live.probeCommand.trim()).not.toBe('')
+  })
+
+  /*
+   * `coverage: "include"` on a lane with no instrumentation is the e2e
+   * anti-pattern lane-policy names: the report is missing or empty, and an
+   * empty report scores 100%, so adding this lane would RAISE the merged total
+   * while measuring nothing.
+   */
+  it('does not claim to contribute coverage', () => {
+    for (const lane of config.lanes) {
+      if (lane.coverage === 'include') {
+        expect(lane.coverageSummaryPath ?? '').not.toBe('')
+      }
+    }
+    expect(config.lanes.find((lane) => lane.name === 'live').coverage).toBe('none')
+  })
+
+  /* The fast inner loop must stay where it was. A live lane that quietly took
+   * over `taskCompleted` would be a far bigger change than adding a lane. */
+  it('leaves the unit lane gating taskCompleted and commit', () => {
+    const unit = config.lanes.find((lane) => lane.name === 'unit')
+
+    expect(unit).toBeDefined()
+    expect(unit.gateOn).toEqual(['taskCompleted', 'commit'])
+  })
+
+})
+
+describe('assertRan — the reports it used to accept', () => {
+  /* ⚠️ **EACH OF THESE PASSED, AND EACH IS A RUN THAT PROVED NOTHING.** The
+     counters `ran` and `expected` are numbers the PAGE reports about itself,
+     and nothing reconciled them with the entries — so an empty report with the
+     right numbers was clean, six entries under one id were clean, and a report
+     that declared itself failed was clean. In the file whose entire job is to
+     refuse a hollow run. */
+  const good = () => ({
+    engine: 'WebKit',
+    ran: CHECKS.length,
+    expected: CHECKS.length,
+    ok: true,
+    failures: 0,
+    checks: CHECKS.map((one) => ({ id: one.id, pass: true, detail: '' })),
+  })
+  const parity = (rows) => ({ rows: Array.from({ length: rows }, (_, i) => ({ id: i, same: true })) })
+
+  it('accepts a report that is complete and consistent', () => {
+    expect(assertRan(parity(3), good(), 3)).toEqual([])
+  })
+
+  it('refuses an EMPTY check list wearing the right counters', () => {
+    expect(assertRan(parity(3), { ...good(), checks: [] }, 3).join(' ')).toMatch(/carries 0|absent from the report/u)
+  })
+
+  it('refuses the same check reported more than once', () => {
+    const one = CHECKS[0]
+    const dom = { ...good(), checks: CHECKS.map(() => ({ id: one.id, pass: true, detail: '' })) }
+    expect(assertRan(parity(3), dom, 3).join(' ')).toMatch(/reported more than once/u)
+  })
+
+  it('refuses a report that declares itself failed even when every entry passed', () => {
+    expect(assertRan(parity(3), { ...good(), ok: false, failures: 2 }, 3).join(' ')).toMatch(/declares itself failed/u)
+  })
+
+  it('refuses an entry that is not a check at all', () => {
+    expect(assertRan(parity(3), { ...good(), checks: [null, ...good().checks.slice(1)] }, 3).join(' ')).toMatch(/not a check/u)
+  })
+})
+
+describe('word-snap-live — failing closed', () => {
+  /* The lane's probe. It must work with no bridge, no app and no book —
+   * otherwise the probe reports the lane broken on every machine where the app
+   * is not up, which is most of them. Outside the config-dependent block on
+   * purpose: this one runs everywhere. */
+  it('probes green with no bridge, naming every check it would run', () => {
+    const { code, out } = run(['--list'])
+
+    expect(code).toBe(0)
+    for (const check of CHECKS) expect(out).toContain(check.id)
+    expect(CHECKS.length).toBeGreaterThan(0)
+  })
+
+  /*
+   * **The green-with-nothing-run guard.** A runner that caught the connection
+   * error and reported "0 checks, 0 failures" would look identical to a clean
+   * sweep in any summary. The exit code is the only thing that separates them,
+   * and the port belongs in the message because "could not connect" without one
+   * sends the reader to the wrong machine.
+   */
+  it('exits non-zero when the bridge is unreachable, naming the bridge and the port', async () => {
+    const port = await closedPort()
+    const { code, err } = run(['--port', String(port)])
+
+    expect(code).not.toBe(0)
+    expect(err).toMatch(/bridge/i)
+    expect(err).toContain(String(port))
+  })
+
+  /*
+   * The zero-row case. `ok = failures === 0` scores an empty corpus a perfect
+   * pass — the same silent success as a coverage report measuring zero lines.
+   * Checked BEFORE the bridge is dialled, so the reason names the corpus rather
+   * than the connection.
+   */
+  it('exits non-zero on an empty corpus, before it ever dials the bridge', () => {
+    const path = tempFile('empty-corpus.json', '[]')
+    const { code, err } = run(['--corpus', path])
+
+    expect(code).not.toBe(0)
+    expect(err).toMatch(/corpus/i)
+    expect(err).toMatch(/empty|zero rows/i)
+    expect(err).not.toMatch(/bridge/i)
+  })
+
+  it('exits non-zero on a corpus file that is not an array of rows', () => {
+    const path = tempFile('not-rows.json', '{"rows": []}')
+    const { code, err } = run(['--corpus', path])
+
+    expect(code).not.toBe(0)
+    expect(err).toMatch(/corpus/i)
+  })
+})
+
+describe('word-snap-live — what it concludes from a report', () => {
+  /**
+   * The round trip needs a running app, so it cannot be gated. What the runner
+   * DECIDES from a report is pure, and it is where a hollow run would be turned
+   * green — so it is tested here, in the lane that always runs.
+   */
+  const goodParity = { engine: 'WebKit', rows: [{ id: 'a' }, { id: 'b' }] }
+  const goodDom = {
+    engine: 'Mozilla/5.0 … Version/26.6 Safari/605.1.15',
+    expected: CHECKS.length,
+    ran: CHECKS.length,
+    failures: 0,
+    reason: null,
+    checks: CHECKS.map((check) => ({ id: check.id, pass: true, detail: 'ok' })),
+  }
+
+  /* Runs first, and it is what stops every case below from being vacuous: a
+   * function that returned a problem for everything would pass all of them. */
+  it('accepts a complete, passing pair', () => {
+    expect(assertRan(goodParity, goodDom, 2)).toEqual([])
+  })
+
+  it('rejects a corpus report with no rows', () => {
+    const problems = assertRan({ ...goodParity, rows: [] }, goodDom, 2)
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toMatch(/zero rows/i)
+  })
+
+  it('rejects a corpus report built from a different number of rows', () => {
+    expect(assertRan(goodParity, goodDom, 3).join(' ')).toMatch(/2 rows against 3 sent/)
+  })
+
+  it('rejects a bridge answer that is not a report at all', () => {
+    expect(assertRan(null, null, 2).length).toBeGreaterThan(0)
+    expect(assertRan(goodParity, undefined, 2).join(' ')).toMatch(/not a report/i)
+    expect(assertRan(goodParity, {}, 2).join(' ')).toMatch(/not a report/i)
+  })
+
+  /* The green-with-nothing-run shape, in its most plausible disguise: a report
+   * with no failures because it ran nothing. */
+  it('rejects a DOM report that ran nothing, however clean it looks', () => {
+    const hollow = { ...goodDom, ran: 0, failures: 0, checks: [], reason: 'no document' }
+
+    expect(assertRan(goodParity, hollow, 2).join(' ')).toMatch(/ran 0 of/)
+  })
+
+  it('rejects a DOM report that declares fewer checks than are defined here', () => {
+    const short = { ...goodDom, expected: CHECKS.length - 1, ran: CHECKS.length - 1 }
+
+    expect(assertRan(goodParity, short, 2).join(' ')).toContain(String(CHECKS.length))
+  })
+
+  it('names the check that failed, and its detail', () => {
+    const failed = {
+      ...goodDom,
+      failures: 1,
+      checks: goodDom.checks.map((check, i) =>
+        i === 0 ? { ...check, pass: false, detail: 'identical after=true' } : check,
+      ),
+    }
+
+    const problems = assertRan(goodParity, failed, 2)
+    expect(problems.join(' ')).toContain(CHECKS[0].id)
+    expect(problems.join(' ')).toContain('identical after=true')
+  })
+
+  /* The engine string is the one field that proves the snippet ran in a browser
+   * rather than being answered by something in the middle. */
+  it('rejects a report that did not come from a browser engine', () => {
+    const noEngine = { ...goodDom, engine: 'no navigator — not a browser engine' }
+
+    expect(assertRan(goodParity, noEngine, 2).join(' ')).toMatch(/engine/i)
+    expect(assertRan(goodParity, { ...goodDom, engine: '' }, 2).join(' ')).toMatch(/engine/i)
+  })
+})
+
+describe('word-snap-live — the DOM-check snippet', () => {
+  /*
+   * The snippet is assembled from the app's own TypeScript at run time, so the
+   * thing that breaks is the assembly, not the algorithm. Compiling it here
+   * turns "a SyntaxError from a webview, at a position pointing at something
+   * innocent" into a failure in the lane that always runs.
+   */
+  it('compiles as JavaScript', () => {
+    expect(() => new Script(buildDomSnippet())).not.toThrow()
+  })
+
+  /*
+   * The report's own counters are what make "it actually ran" checkable, and
+   * they have to agree with the runner's expectations or the agreement is
+   * vacuous. `expected` is set before any DOM is touched precisely so this
+   * assertion survives the no-DOM path below.
+   */
+  it('declares exactly the checks the runner expects', () => {
+    const report = evaluateSnippet(buildDomSnippet())
+
+    expect(report.expected).toBe(CHECKS.length)
+  })
+
+  /*
+   * Evaluated in Node, where there is no `document`. A snippet that returned
+   * `ok: true` here would return `ok: true` from a webview that had been torn
+   * down, from a window with no document, and from a bridge that answered
+   * without running anything.
+   */
+  it('fails closed in an engine with no DOM rather than reporting a clean sweep', () => {
+    const report = evaluateSnippet(buildDomSnippet())
+
+    expect(report.ok).toBe(false)
+    expect(report.ran).toBe(0)
+    expect(report.reason).toMatch(/document|DOM/i)
+    expect(report.checks).toEqual([])
+  })
+
+  /*
+   * The snippet crosses a process boundary as JSON and is then parsed by
+   * WebKit. A JS line terminator inside a comment ends that comment early and
+   * turns the rest of the line into code; an unpaired surrogate does not
+   * survive UTF-8 at all. Both arrive from the inlined source, where escaping
+   * is not an option because a comment is not a string.
+   */
+  it('removes its fixture frame, however the run ends', async () => {
+    /* ⚠️ **EVERY OTHER TEST OF THE SNIPPET RUNS WITHOUT A DOM**, where it stops
+       at the first guard — which is the point of those, and leaves everything
+       past the guard unexecuted, the fixture iframe included. So the one thing
+       the snippet promises about its own housekeeping, that it never leaves an
+       off-screen frame behind, had nothing asserting it.
+
+       A jsdom window rather than the `jsdom` test environment: this file is
+       assembled from the app's source through `import.meta.url`, which under
+       that environment is not a file URL and cannot be read from. jsdom is not
+       WebKit and several checks will not pass in it — that is not what this
+       measures. What it measures is what the snippet LEAVES. */
+    const { JSDOM } = await import('jsdom')
+    const snippet = buildDomSnippet()
+
+    const clean = new JSDOM('<!doctype html><body></body>', { runScripts: 'outside-only' })
+    clean.window.eval(snippet)
+    expect(clean.window.document.querySelectorAll('iframe')).toHaveLength(0)
+
+    /* ⚠️ **AND WHEN THE FIXTURE ITSELF FAILS, WHICH IS THE CASE IT LEAKED.**
+       The cleanup used to begin after the fixture was built, so a throw from
+       the markup assignment, the selection or the checks table left the iframe
+       attached — with a selection inside it, which the next run inherits.
+       Injected by giving the frame's document a body whose `innerHTML`
+       refuses, the first thing the snippet does with it. */
+    const broken = new JSDOM('<!doctype html><body></body>', { runScripts: 'outside-only' })
+    const real = broken.window.document.createElement.bind(broken.window.document)
+    broken.window.document.createElement = (tag) => {
+      const made = real(tag)
+      if (tag !== 'iframe') return made
+      Object.defineProperty(made, 'contentDocument', {
+        configurable: true,
+        get: () => ({
+          body: {
+            set innerHTML(_value) {
+              throw new Error('the fixture would not build')
+            },
+          },
+        }),
+      })
+      return made
+    }
+    expect(() => broken.window.eval(snippet)).toThrow(/the fixture would not build/u)
+    expect(broken.window.document.querySelectorAll('iframe')).toHaveLength(0)
+  })
+
+  it('carries nothing that would break at parse in transit', () => {
+    const snippet = buildDomSnippet()
+    const lineSeparator = String.fromCharCode(0x2028)
+    const paragraphSeparator = String.fromCharCode(0x2029)
+    const offenders = []
+
+    // Iteration is by code point, so a well-formed astral pair arrives as one
+    // two-unit string; a one-unit string in the surrogate range is unpaired.
+    for (const character of snippet) {
+      const code = character.charCodeAt(0)
+      const lone = character.length === 1 && code >= 0xd800 && code <= 0xdfff
+      if (lone || character === lineSeparator || character === paragraphSeparator) {
+        offenders.push('U+' + code.toString(16).toUpperCase().padStart(4, '0'))
+      }
+    }
+
+    expect(offenders).toEqual([])
+  })
+
+  /*
+   * WKWebView's native `evaluateJavaScript` is the path that returns a result
+   * synchronously; the bridge falls back to an eval-plus-IPC round trip the
+   * moment it sees any of these tokens anywhere in the script, including in a
+   * comment. That fallback has a five-second timeout and needs `__TAURI__` in
+   * the page, so a stray "async " in a doc comment turns a working check into
+   * an intermittent one for reasons nothing reports.
+   */
+  it('avoids the tokens that push the bridge off its native evaluation path', () => {
+    const snippet = buildDomSnippet()
+
+    for (const token of ['await ', 'async ', '(async', '.then(', 'Promise.', 'new Promise(']) {
+      expect(snippet).not.toContain(token)
+    }
+  })
+
+  /* The corpus and the DOM checks are two halves of one run; a live report that
+   * carried the checks but not the rows would be half a verification. */
+  it('is a different snippet from the corpus parity one, and both are non-empty', () => {
+    expect(buildDomSnippet().length).toBeGreaterThan(0)
+    expect(CORPUS.length).toBeGreaterThan(0)
+  })
+})

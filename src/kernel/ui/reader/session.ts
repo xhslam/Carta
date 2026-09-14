@@ -1,0 +1,3545 @@
+import { navigationQueue } from './navigationQueue'
+import type {
+  CreateOverlayDetail,
+  DrawAnnotationDetail,
+  ExternalLinkDetail,
+  LinkDetail,
+  LoadDetail,
+  RelocateDetail,
+  TocItem,
+  View,
+} from 'foliate-js/view.js'
+import {
+  FootnoteHandler,
+  type FootnoteRenderDetail,
+  type FootnoteType,
+} from 'foliate-js/footnotes.js'
+import type { AskPassage } from '../../core/companion'
+import type { ResolvedCfi } from './reanchor'
+import { foreignWeight } from '../../core/circle/foreign'
+import { reanchorPass, type PassOutcome, type PendingMark } from './reanchorPass'
+import { screenPassages } from './passages'
+import { rangeBoxInHost, type HostRect } from './coordinates'
+import { isBacklink } from './backlink'
+import { directionOf } from './direction'
+import { refuseBookScripts, stripScripts } from './bookScripts'
+
+/* Re-exported where it always lived — the rule itself moved to `direction.ts`
+ * so speech could import it without carrying a copy (audit round 1, #842). */
+export { directionOf } from './direction'
+import { suppressEmptyGeneratedContent } from './generatedContent'
+import { markFigures } from './markFigures'
+import { matteFigures } from './matteFigures'
+import { markProse } from './markProse'
+import { markSmallText } from './markSmallText'
+import {
+  ANNOTATION_KINDS,
+  MARK_STYLES,
+  MARK_TINTS,
+  type AnnotationKind,
+  type MarkStyle,
+  type MarkTint,
+} from '../../core/marks'
+import type { BookMeta, ReaderPosition } from '../../core/bookMeta'
+import { isEmptySource, type BookSource } from '../../core/formats'
+import type { OpenedBook } from './protection'
+import { coverFrom } from '../../core/coverArt'
+import { deferSnap } from './wordSnap/deferredSnap'
+import { watchGestureProvenance } from './wordSnap/gestureProvenance'
+import { createReflowGuard } from './wordSnap/invalidate'
+import { wheelPager, type PageIntent } from './wheelPaging'
+import { markContext } from './wordSnap/markContext'
+import { connectedRange, rangeText } from './wordSnap/rangeText'
+
+/**
+ * The reader's lifecycle, as a plain object.
+ *
+ * Startup is a chain of awaits — import the module, create the element, open
+ * the book, configure the renderer, display the first section — and React can
+ * unmount at any point in that chain. A bare `disposed` flag checked at each
+ * step is easy to get subtly wrong and impossible to test, which is exactly
+ * what the audit found: teardown could clear the view reference while an open
+ * was still in flight, so the view that arrived afterwards had nothing left to
+ * close it and kept its iframes, observers and listeners forever.
+ *
+ * Here disposal is a single latch. `dispose()` is idempotent and can be called
+ * before, during, or after startup; `settle()` hands every completed step back
+ * to the latch, so whichever side finishes last performs the close. None of it
+ * touches React, so all of it can be asserted directly.
+ */
+
+/**
+ * Is the pointer over a box the BOOK's own author made scrollable?
+ *
+ * A code listing or a wide table in an `overflow: auto` div is ordinary book
+ * markup, and its content has to stay reachable — so an event over one belongs
+ * to it, not to page turning.
+ *
+ * Deliberately stops at `body`. The document scroller above it is the
+ * renderer's, and handing events back to that is what the flow question below
+ * decides; answering it here as well would consume nothing and page nothing.
+ *
+ * `overflow: auto` and `scroll` only — `hidden` is scrollable via script but
+ * not by a wheel, and treating it as scrollable would swallow gestures over any
+ * clipped box, which is a very common thing for a book to contain.
+ */
+function scrollableUnder(event: WheelEvent): boolean {
+  const vertical = Math.abs(event.deltaY) > Math.abs(event.deltaX)
+  const delta = vertical ? event.deltaY : event.deltaX
+  if (delta === 0) return false
+
+  let node = event.target as Element | null
+  for (; node && node.nodeName !== 'BODY' && node.nodeName !== 'HTML'; node = node.parentElement) {
+    const style = node.ownerDocument?.defaultView?.getComputedStyle(node)
+    if (!style) continue
+    const overflow = vertical ? style.overflowY : style.overflowX
+    if (overflow !== 'auto' && overflow !== 'scroll') continue
+
+    const size = vertical ? node.clientHeight : node.clientWidth
+    const content = vertical ? node.scrollHeight : node.scrollWidth
+    const position = vertical ? node.scrollTop : node.scrollLeft
+    const remaining = content - size
+    if (remaining <= 1) continue
+    /* Only while it can still MOVE the way the gesture asks. A box scrolled to
+     * its end must hand the gesture on, or the reader is stuck at the foot of a
+     * code listing with a page that will not turn. */
+    if (delta > 0 ? position < remaining - 1 : position > 1) return true
+  }
+  return false
+}
+
+/**
+ * How long after scrolling backwards a page may still arrive and open at its foot.
+ *
+ * A page load that a gesture caused follows it within a frame or two; anything
+ * slower than this came from somewhere else. Generous rather than tight because
+ * failing the check is a real cost — the reader lands at the head of the page
+ * and has to scroll down through it — while passing it late costs one surprising
+ * scroll position.
+ */
+const ENTER_AT_FOOT_MS = 1500
+
+/**
+ * Hand the main thread back — what `reanchorPass` awaits between sections.
+ *
+ * ⚠️ **NOT `requestAnimationFrame`, and the reason is written down elsewhere in
+ * this repository already.** An occluded window stops servicing rAF —
+ * `#openAtFootIfArrivedBackwards` defends against exactly that, and AGENTS.md
+ * records the day it cost an investigation, because WebKit parks pdf.js's page
+ * render there and the book loads, reports its page count and shows a blank
+ * canvas with no error anywhere. A re-anchoring pass parked the same way would
+ * simply never finish: the reader switches away mid-open and comes back to
+ * marks that are still unplaced, with nothing to say why.
+ *
+ * `scheduler.yield()` where the engine has it — it resumes at the FRONT of the
+ * task queue, so a walk that yields forty times is not forty trips behind every
+ * pending timer. `setTimeout(0)` otherwise, which is throttled in a hidden tab
+ * but does keep running, which is the property that matters here.
+ */
+const BREATHE = (): Promise<void> => {
+  const scheduler = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler
+  if (typeof scheduler?.yield === 'function') return scheduler.yield()
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/** One hit, flattened from foliate's mixed yield shapes. */
+export interface SearchHit {
+  readonly cfi: string
+  readonly label: string
+  readonly pre: string
+  readonly match: string
+  readonly post: string
+}
+
+/**
+ * Enough of a mark to draw it.
+ *
+ * Deliberately not the stored `Mark`: the session has no business knowing what
+ * a mark's note says or when it was made, and keeping the anchor narrow is what
+ * lets the drawing be reasoned about without the store in view.
+ */
+export interface MarkAnchor {
+  /**
+   * `ResolvedCfi`, NOT `string` — WI-22.A1, and the twin of the `kind`
+   * narrowing below.
+   *
+   * `kind` refuses a bookmark at this door; this refuses a passage with no
+   * anchor in the build now open. The only way to hold one is to have gone
+   * through `isPlaced`/`placedIn` (a checked narrowing) or `cfiFor` (the
+   * resolver's own mint, which takes a live `Range` as its evidence). A
+   * foreign passage arrives as three strings and can do neither, so the
+   * compiler stops it here rather than the painter drawing it on whatever the
+   * path happens to hit.
+   *
+   * `surfaces.md`: *"so the compiler refuses an unresolved one at the
+   * painter's door, the way `MarkAnchor` narrowing already refuses a bookmark
+   * there."*
+   */
+  readonly cfi: ResolvedCfi
+  readonly sectionIndex: number
+  /**
+   * `AnnotationKind`, NOT `MarkKind` — a bookmark cannot be drawn.
+   *
+   * The runtime split at `MarkSnapshot` already keeps one away from here, and
+   * that was the only thing doing so: this field took the whole union, so the
+   * guarantee rested on every caller reading from the right list. `drawMark`
+   * is public on the navigator. Narrowing it makes the compiler refuse a
+   * bookmark at the painter's door instead.
+   */
+  readonly kind: AnnotationKind
+  /* Carried on the anchor rather than looked up when the overlay draws: the
+     painter runs inside a `draw-annotation` handler that has the annotation and
+     nothing else, and giving it the store to search would be a second source of
+     truth for what a mark looks like, resolved at a different moment. */
+  readonly tint: MarkTint
+  readonly style: MarkStyle
+}
+
+/**
+ * Another reader's passage, ready to draw — WI-22.D2.
+ *
+ * ⚠️ **NOT A `MarkAnchor`, AND THE DIFFERENCE IS THE FEATURE.** A `MarkAnchor`
+ * carries `tint` and `style`, which are the READER'S OWN vocabulary —
+ * *"agreements in green and questions in purple"* — and `surfaces.md` forbids
+ * a friend's mark claiming it: *"A friend's highlight drawn in your tints is a
+ * passage you will remember marking and did not."* So this type has neither
+ * field, and the wire does not carry them either. There is nothing to ignore.
+ *
+ * The companion is the precedent and the mechanism: *"a companion mark is an
+ * amber underline whatever the reader has chosen for their own, because here
+ * the colour is not a preference — it is what says whose mark this is."*
+ */
+export interface ForeignAnchor {
+  /** `ResolvedCfi` — the compiler refuses an unanchored passage here (A1). */
+  readonly cfi: ResolvedCfi
+  readonly sectionIndex: number
+  /**
+   * The Overlayer key — `circle:<person>:<pub>`.
+   *
+   * ⚠️ **SEPARATE FROM THE CFI, WHICH IS THE WHOLE POINT.** `review.md`'s
+   * overlay blocker 1: `addAnnotation` keys the Overlayer on the annotation's
+   * VALUE, so several readers at one CFI collapse into one entry and the last
+   * writer wins — *"This breaks the feature's central case — '4 of 11 readers
+   * marked this.'"* `Overlayer.add(key, range, …)` already takes them
+   * separately; what does not is `addAnnotation`, and that is one line in our
+   * own fork (`annotation.key ?? annotation.value`).
+   *
+   * ⚠️ **UNTIL THE FORK MOVES, THIS IS CARRIED AND IGNORED.** Passing it costs
+   * nothing and changes nothing today; the day the fork lands, the collapse
+   * stops without another edit here.
+   */
+  readonly key: string
+  /**
+   * How many readers marked this passage — see `foreignWeight`.
+   *
+   * Weight carries multiplicity because colour cannot: there is ONE neutral
+   * hue for every foreign mark, so the only channel left is how heavy the rule
+   * is. That is what makes *"4 of 11 readers marked this"* legible without a
+   * click, which WI-22.D2's falsifier asks for.
+   */
+  readonly readers: number
+}
+
+/** A live selection in the book, with its anchor already resolved. */
+export interface SelectionSnapshot {
+  readonly cfi: string
+  readonly sectionIndex: number
+  readonly text: string
+  /**
+   * The text on either side of the selection — see `markContext`.
+   *
+   * Read HERE, from the live range, because this is the only place it exists.
+   * By the time a mark is stored the range is gone, and recovering the context
+   * from a stored mark means re-opening the book and resolving its CFI.
+   */
+  readonly prefix: string
+  readonly suffix: string
+  /** In the BOOK document's coordinate space — translate before use. */
+  readonly range: Range
+}
+
+/**
+ * Concrete colours for the two mark provenances.
+ *
+ * Resolved by the caller at draw time rather than read from a custom property,
+ * because the Overlayer sets `fill` as a presentation ATTRIBUTE, and `var()` is
+ * not valid in one. Marks would silently draw black.
+ */
+export interface MarkPalette {
+  /** The band drawn behind the words, per tint. */
+  readonly fill: Record<MarkTint, string>
+  /** The rule drawn under them, per tint — and the colour of the swatch that
+   *  offers it, which is why the saturated value lives here and not only in a
+   *  stylesheet. */
+  readonly rule: Record<MarkTint, string>
+  /**
+   * §01's companion hue. A companion mark is an amber underline whatever the
+   * reader has chosen for their own, because here the colour is not a
+   * preference — it is what says whose mark this is.
+   */
+  readonly companion: string
+  /**
+   * The hue every foreign mark is drawn in — one, for every reader.
+   *
+   * ⚠️ **ONE HUE AND NOT A PALETTE.** Giving each friend a colour would put
+   * them in competition with the reader's own three, and `MarkTint` is where
+   * the reader's meaning lives. A single neutral rule says *"somebody else"*;
+   * `readers` says how many, through weight.
+   */
+  readonly foreign: string
+}
+
+/**
+ * The Overlayer's draw functions, passed in so foliate stays lazily loaded.
+ *
+ * One per `MarkStyle`, plus the companion's, which reuses `underline`. Named
+ * for the STYLE rather than for the Overlayer function behind it — `wave` is
+ * foliate's `squiggly`, and §15's word is the one the interface uses.
+ */
+export interface MarkPainters {
+  readonly fill: unknown
+  readonly underline: unknown
+  readonly wave: unknown
+}
+
+/**
+ * A note, extracted and ready to show.
+ *
+ * THE ELEMENT, NOT ITS TEXT. `FootnoteHandler` renders the note into a real
+ * `foliate-view`, so it arrives with the book's own markup, its own styles and
+ * its links intact — a note carrying emphasis, a nested citation or a table
+ * survives, where `textContent` would flatten all three. The host mounts it.
+ *
+ * `at` is where the REFERENCE was, in host coordinates, because that is what a
+ * popover is placed against — not the note, which is somewhere else entirely.
+ */
+/**
+ * Where a reference sits, in the host's coordinates.
+ *
+ * A RANGE AROUND THE ELEMENT, because `coordinates` speaks ranges and a
+ * superscript marker is usually one character — `getBoundingClientRect` on the
+ * `<a>` would work and would be a second way of crossing the same iframe
+ * boundary, which is how two answers to one question begin. Null when the
+ * anchor's document has gone, which is what a section re-render does.
+ */
+function anchorRectInHost(a: Element, host: HTMLElement): HostRect | null {
+  const doc = a.ownerDocument
+  if (!doc) return null
+  try {
+    const range = doc.createRange()
+    range.selectNode(a)
+    return rangeBoxInHost(range, host)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Let go of a note's view — CLOSE IT BEFORE DETACHING IT.
+ *
+ * `remove()` alone throws, and the throw reaches the app's error boundary: the
+ * paginator keeps a `ResizeObserver` on its container and the inner view keeps
+ * one on `doc.body`, so detaching fires them with a size of zero, `render`
+ * runs against a document that is no longer there, and `columnize` reads
+ * `doc.documentElement` off null. **Closing a footnote took the book down.**
+ *
+ * `close()` is what unobserves — it calls `renderer.destroy()`, which does
+ * `#observer.unobserve` on both. It does NOT destroy the book, which matters
+ * because a note's view shares one with the reader: `Loader.destroy`, the call
+ * that would revoke every shared object URL, is reachable only through
+ * `Book.destroy`, and nothing here calls that.
+ *
+ * EXPORTED FOR THE ORDER. The order is the whole of the fix and it cannot be
+ * checked from outside the class — these suites run without a DOM, so no real
+ * view can be built. A stand-in through this seam can prove `close` precedes
+ * `remove`, which is the thing that was wrong.
+ *
+ * Guarded, because a teardown that throws must not stop the popover closing:
+ * the reader asked for it to go away, and that has to happen either way.
+ */
+export function releaseNoteView(view: Pick<View, 'close' | 'remove'>): void {
+  try {
+    view.close()
+  } catch (cause) {
+    console.warn('Carta: a note view would not close cleanly', cause)
+  }
+  view.remove()
+}
+
+/**
+ * The origin a note's anchor rect is measured from.
+ *
+ * THE BOX THE POPOVER SAYS IT IS POSITIONED IN — its own offset parent, which
+ * is by definition the element its `left` and `top` resolve against, reported
+ * through `setFootnoteMount`. So the number this produces and the number the
+ * stylesheet consumes are in one space.
+ *
+ * REPORTED, NOT DERIVED. Working it out here as `mount.offsetParent` looks
+ * equivalent and is not: the mount is a CHILD of the popover and the popover is
+ * `position: absolute`, so that expression returns the popover — parked at
+ * `left: -99999` while a note measures. Every anchor came out a hundred
+ * thousand pixels away, `place` called every one of them `detached`, and the
+ * popover stopped appearing at all.
+ *
+ * It was `#host`, the element foliate renders into, and that is a DIFFERENT
+ * box: inside the stage's padding, inside the reading column's titlebar inset.
+ * Every rect was correct and every note was drawn off by the sum of those —
+ * the exact failure `placement.ts` names in its header, numerically valid and
+ * wrong by a container's offset, with nothing able to tell. It is also the
+ * space `proseColumn` reports the measure in, which is what lets the popover be
+ * bounded by the words rather than by the whole grid.
+ *
+ * BY CAPABILITY, NOT BY `instanceof HTMLElement`. These suites run without a
+ * DOM on purpose, so naming a DOM constructor at run time throws `HTMLElement
+ * is not defined` in a session that is otherwise perfectly testable — it did,
+ * in two tests, the moment this was written that way. What the caller needs is
+ * a box, so a box is what is asked for.
+ *
+ * Falls back to the host when nothing was reported — before the popover has
+ * mounted, and for a popover with no offset parent, which is what `display:
+ * none` produces. The fallback is the behaviour this replaced, so a wiring
+ * failure puts the note back where it used to be rather than nowhere.
+ */
+export function noteSpace(within: HTMLElement | null, host: HTMLElement): HTMLElement {
+  return typeof within?.getBoundingClientRect === 'function' ? within : host
+}
+
+/** What a link inside a note needs, to move the reader instead of the note. */
+export interface NoteLinkHost {
+  /** Tell the host where the reader is leaving from, so `⌘[` can come back. */
+  readonly onLink: (detail: LinkDetail, event: Event) => void
+  /** A scheme that leaves the book. The host cancels and routes it. */
+  readonly onExternalLink: (detail: ExternalLinkDetail, event: Event) => void
+  /** Take the note down. */
+  readonly close: () => void
+  /** Move the READER — the main view, not the note's. */
+  readonly goTo: (href: string) => void
+}
+
+/**
+ * A link CLICKED INSIDE A NOTE moves the reader, not the note.
+ *
+ * A note is a whole `foliate-view`, so foliate wires its document up the same
+ * way it wires the book's: unhandled, the note's own `link` event ends in
+ * `noteView.goTo(href)` — and the note view navigates ITSELF. Clicking the `↩`
+ * at the end of an endnote LOADED THE WHOLE CHAPTER INTO THE NOTE BOX,
+ * measured at 90px tall, with the reader still on the page they started from.
+ * That is the other half of "no back to reference anchor": the control is right
+ * there in the note, and it did the opposite of what it says.
+ *
+ * So: cancel, take the note down, and send the reader there.
+ *
+ * EXPORTED FOR THE ORDER, as `releaseNoteView` is, and for the same reason —
+ * the order is the whole of it and cannot be checked from outside the class.
+ * `onLink` comes BEFORE `goTo` so the origin is recorded from where the reader
+ * still is; `close` comes before both so the note is not sitting over the page
+ * it is sending them to. These suites run without a DOM, so a stand-in through
+ * this seam is the only way to prove any of that.
+ *
+ * PER NOTE VIEW, NOT ONCE. Unlike the footnote handler's own events, each note
+ * is a new element and there is nowhere else to put this. The view is closed
+ * and dropped when the note goes, so the listeners go with it.
+ */
+export function watchNoteLinks(
+  noteView: Pick<View, 'addEventListener'>,
+  host: NoteLinkHost,
+): void {
+  noteView.addEventListener('link', (event) => {
+    /* The note view must not navigate itself. This is the fix; the rest is
+       where the reader goes instead. */
+    event.preventDefault()
+    const detail = (event as CustomEvent<LinkDetail>).detail
+    host.close()
+    host.onLink(detail, event)
+    host.goTo(detail.href)
+  })
+  noteView.addEventListener('external-link', (event) => {
+    /* THE HOST DECIDES, as it does for the book — it cancels and hands the href
+       to the platform's browser through a route Carta chose. Left alone,
+       foliate calls `globalThis.open` with the book's own string, and a note is
+       no more trustworthy than a page. */
+    host.onExternalLink((event as CustomEvent<ExternalLinkDetail>).detail, event)
+  })
+}
+
+export interface FootnoteRender {
+  readonly view: View
+  readonly href: string
+  readonly type: FootnoteType
+  readonly at: HostRect | null
+}
+
+/**
+ * One click on a note reference: where its marker was, and which click it is.
+ *
+ * ⚠️ **A SHARED `FootnoteHandler` CANNOT SAY WHICH NOTE A VIEW BELONGS TO.**
+ * It emits `before-render` carrying `{ view }` and nothing else, so a session
+ * holding one handler had to pair views to clicks by ARRIVAL ORDER — a FIFO
+ * queue — and neither `resolveHref` nor the note's own render settles in click
+ * order. Two notes in flight could cross: the older one was shown, at the
+ * newer one's anchor, and the note the reader actually clicked was released.
+ *
+ * The same queue could also come up EMPTY, when the reader closed the note
+ * before it rendered, and the fallback then handed the arriving view the
+ * current sequence — which passed the supersession check and reopened the note
+ * they had just dismissed.
+ *
+ * So a request owns its own handler and its own two listeners (see
+ * `#openFootnote`), and the pairing is an identity rather than a guess. A
+ * handler holds only the `detectFootnotes` switch, left at its default, so a
+ * fresh one per click is equivalent — and it becomes unreachable with its
+ * listeners once its note is done, which is why "one per session, or a
+ * listener leaks per note followed" no longer applies.
+ */
+interface NoteRequest {
+  readonly at: HostRect | null
+  readonly seq: number
+}
+
+export interface SessionCallbacks {
+  /**
+   * A link inside the book was followed, BEFORE foliate acts on it.
+   *
+   * The host is handed the detail and the event, and what it does with the
+   * event decides what happens: `preventDefault()` takes the link over, and
+   * leaving it alone lets foliate navigate as it always has. See `LinkDetail`.
+   *
+   * The session does not decide. Whether a link is a footnote to show in
+   * place, or a destination to jump to with the origin recorded, is a question
+   * about panels and a jump stack — neither of which a renderer session has
+   * any business knowing about. This is the same boundary that keeps it from
+   * touching the mark store.
+   */
+  onLink: (detail: LinkDetail, event: Event) => void
+  /**
+   * A footnote was followed, and here is the note.
+   *
+   * Null means the popover should close — a page turn, a new section, or the
+   * session going away. The host decides where to put it and how it is
+   * dismissed; the session decides only what it contains, which is the same
+   * line `onLink` draws.
+   */
+  onFootnote: (note: FootnoteRender | null) => void
+  /**
+   * A link whose scheme leaves the book. Same contract, and the same reason
+   * for existing at all: unhandled, foliate hands the raw href to
+   * `globalThis.open`, and an EPUB is a zip a stranger wrote.
+   */
+  onExternalLink: (detail: ExternalLinkDetail, event: Event) => void
+  onToc: (toc: readonly TocItem[]) => void
+  onRelocate: (position: ReaderPosition) => void
+  onDocument: (doc: Document | null) => void
+  onMeta: (meta: BookMeta) => void
+  /**
+   * The book's own jacket, or null when it declares none.
+   *
+   * Published as a BLOB rather than written anywhere, because the session has
+   * no business knowing where covers are kept — the same boundary that keeps it
+   * from touching the mark store. It arrives once per open, beside the
+   * metadata, which is the only moment the parsed book is in hand.
+   *
+   * Separate from `BookMeta` because that is plain data that gets STORED, and a
+   * jacket must never enter the row: `library.json` is rewritten on every
+   * position save.
+   */
+  onCover: (cover: Blob | null) => void
+  onError: (message: string) => void
+  onNavigator: (navigator: SessionNavigator | null) => void
+  /**
+   * The marks to draw, read afresh each time a section's overlay is built.
+   *
+   * A getter rather than a value because sections are created and destroyed as
+   * the reader scrolls, long after the session started: a snapshot taken at
+   * startup would draw the marks the book had when it opened and nothing made
+   * since.
+   */
+  getMarks: () => readonly MarkAnchor[]
+  /**
+   * The passages other readers shared, already anchored HERE.
+   *
+   * OPTIONAL: a composition with no `circle` capability has none, and a host
+   * that does not supply this draws exactly what it drew before.
+   */
+  getOverlays?: () => readonly ForeignAnchor[]
+  /** Read at draw time, so marks follow a theme change. */
+  getPalette: () => MarkPalette
+  /**
+   * A mark was resolved and drawn, reported with the live Range it landed on.
+   *
+   * This is the only place that Range is available: turning a CFI back into a
+   * Range needs foliate's resolver, which is not public, and the margin marks
+   * need one in order to sit beside the line they belong to. The Range stays
+   * live — it tracks DOM mutations — so re-measuring it after a reflow gives
+   * the new position without resolving anything again.
+   */
+  onMarkDrawn: (cfi: string, range: Range) => void
+  /** The selection in the book changed. Null when it collapsed. */
+  onSelection: (selection: SelectionSnapshot | null) => void
+  /** A drawn mark was clicked, identified by its CFI. */
+  /**
+   * A book was dropped ON the book — see `#watchDrops`.
+   *
+   * The host cannot see this one: the reader is full of iframes once a book is
+   * open, and a drop lands in whichever document is under the pointer.
+   */
+  onFileDropped: (file: File) => void
+  /**
+   * A wheel gesture asked for another page — see `wheelPaging`.
+   *
+   * A semantic event rather than the wheel events it came from. The keymap is
+   * forwarded raw because keystrokes are occasional and the host owns the map;
+   * wheel events arrive tens per second, and re-dispatching each one to be
+   * accumulated somewhere else would be waste. The gesture is recognised where
+   * the events land, and what it MEANS is still the host's to decide.
+   */
+  onPageIntent: (intent: PageIntent) => void
+  /**
+   * The book is fixed-layout, so it cannot REFLOW — but it can still scroll.
+   *
+   * The second half of that used to say it could not, and this work is what made
+   * it false: the same Flow setting reaches `foliate-fxl` as `zoom`, where
+   * `fit-width` overflows a page and the renderer scrolls it. What a fixed
+   * layout cannot do is re-break text, which is what the reading ruler and the
+   * measure depend on.
+   *
+   * Published because the app offers controls that only mean something for a
+   * reflowable book, and a control wired to nothing is worse than an absent one.
+   * Read from the view rather than guessed from the file extension: a PDF is
+   * always fixed-layout, and an EPUB declaring `pre-paginated` is too.
+   */
+  onFixedLayout: (fixed: boolean) => void
+  /**
+   * Which way the book's text runs, once a section has rendered.
+   *
+   * READ OFF THE RENDERED DOCUMENT rather than off the book's metadata, and
+   * that is the reliable half: what matters to anything positioning itself
+   * against the page is the direction the page is ACTUALLY laid out in, which
+   * is the author's stylesheet and `dir` attribute having had their say. A
+   * declared `page-progression-direction` can disagree with both.
+   */
+  onDirection: (direction: 'ltr' | 'rtl') => void
+}
+
+/**
+ * A place in the book, as everything a bookmark is made from — see
+ * `ReaderSession.placeHere`.
+ *
+ * The same five fields a selection publishes (`SelectionSnapshot`) minus the
+ * live Range, and for the same reasons: the CFI is the anchor, the section is
+ * what orders and matches it, and the text with its neighbours is what lets
+ * the place be recognised — and, one day, re-found in another build of the
+ * same work where the CFI resolves to the wrong words. See `Mark.prefix`.
+ */
+export type BookmarkPlace = Omit<SelectionSnapshot, 'range'> & {
+  /**
+   * The TOC label for this place, from the SAME relocation as the anchor.
+   *
+   * Here rather than read off `ReaderPosition` by the caller, which is where it
+   * came from and which left one field of the bookmark a React commit behind
+   * the other four: a bookmark made while the reader was crossing a chapter
+   * boundary carried this chapter's anchor under the previous chapter's name,
+   * and the list is sorted and read by that name.
+   */
+  readonly chapter: string
+}
+
+export interface SessionNavigator {
+  goTo: (target: string) => void
+  /** Jump to a 0..1 fraction of the book (used by progress scrubbers). */
+  goToFraction?: (fraction: number) => void
+  /** Streams hits as they are found; stops when `signal` aborts. */
+  search: (query: string, signal: AbortSignal) => AsyncGenerator<SearchHit>
+  /** Draw a mark immediately, without waiting for the section to re-render. */
+  drawMark: (anchor: MarkAnchor) => void
+  eraseMark: (anchor: MarkAnchor) => void
+  /** Clear the book's selection — after acting on it, per §07. */
+  deselect: () => void
+  /**
+   * The book text on screen, as passages a companion answer can cite.
+   *
+   * READ AT THE MOMENT THE QUESTION IS ASKED, never cached: the reader turns
+   * pages, and an answer grounded in the page before is an answer about
+   * somewhere else. Empty before the first section loads, which is honest —
+   * the companion then has nothing to cite and says so.
+   */
+  passages: () => readonly AskPassage[]
+  /**
+   * Dismiss the note popover and release the view it was rendered in.
+   *
+   * ON THE NAVIGATOR because the SESSION owns that view — `FootnoteHandler`
+   * builds a real `foliate-view` per note, and a host that merely stopped
+   * rendering it would leave an iframe alive with nobody looking at it.
+   */
+  closeFootnote: () => void
+  /**
+   * Register the box notes render into. See `ReaderSession.setFootnoteMount` —
+   * it must be one element that never moves.
+   */
+  setFootnoteMount: (mount: HTMLElement | null, within: HTMLElement | null) => void
+  /**
+   * §11's ← and →.
+   *
+   * Not optional chrome: a fixed-layout book — every PDF — does not scroll,
+   * so these are the ONLY way through it. A scrolled EPUB hid that for a long
+   * time, because scrolling worked and nobody missed the binding.
+   */
+  next: () => void
+  prev: () => void
+  /**
+   * The page to the left, and to the right — in VISUAL terms.
+   *
+   * Distinct from `next`/`prev` and not a synonym for them: in a right-to-left
+   * book the next page is the one on the LEFT. foliate resolves that through
+   * the book's own `dir`, so a gesture that knows only which way the reader
+   * pushed can hand the question over rather than answering it twice.
+   */
+  goLeft: () => void
+  goRight: () => void
+  /**
+   * Where the reader is, as a bookmark's worth of detail — null when this
+   * place cannot be pinned down. See `ReaderSession.placeHere`.
+   *
+   * Takes NOTHING. It took the current CFI, on the reasoning that the host
+   * already holds one and reading a second copy would be a second answer to a
+   * settled question. The host's copy is a React commit behind this session's,
+   * so the two differ exactly while a relocation is in flight — which is when
+   * a reader pressing ⌘B is most likely to be caught.
+   */
+  placeHere: () => BookmarkPlace | null
+  /**
+   * Walk this book for marks that have no anchor here yet — WI-22.A2.
+   *
+   * ON THE NAVIGATOR because the SESSION owns the book: the walk needs
+   * `book.sections[i].createDocument()`, and that is the object
+   * `refuseBookScripts` wrapped at open. A host that parsed the file a second
+   * time to do this would be reading a document the script strip never
+   * touched, which is the one thing that makes the path derived here address
+   * the same words the reader sees.
+   *
+   * Answers what was FOUND. Writing it is the host's — `marks.place` — for the
+   * reason `MarkAnchor` is not the stored `Mark`: the session has no business
+   * knowing where marks live.
+   *
+   * ⚠️ **Not on the reading path.** The walk yields between sections and stops
+   * the moment this session is disposed; see `reanchorPass`. A caller must
+   * still not put it on a page turn — forty cold sections is ~139 ms.
+   */
+  reanchor: (pending: readonly PendingMark[]) => Promise<PassOutcome>
+}
+
+export interface SessionDeps {
+  /** Injected so tests can supply a fake instead of a real custom element. */
+  createView: () => Promise<View>
+  /** Loaded alongside the view so the painters exist before the first paint. */
+  loadPainters: () => Promise<MarkPainters>
+  /**
+   * Turn the source into something `View.open` accepts.
+   *
+   * foliate opens a File or URL by sniffing its type, but it has no PDF loader
+   * — so a PDF is converted into a Book first, one HTML page per PDF page. See
+   * `makePdf`. Everything else passes through unchanged.
+   *
+   * It happens HERE rather than at the call site so that a conversion failure
+   * is reported through the same path as a failed open, and so that a session
+   * disposed mid-conversion still stops before touching a view.
+   *
+   * ⚠️ **REQUIRED, AND IT WAS OPTIONAL.** `start` takes a `BookSource`, which
+   * has included `RangedSource` since the browser client learned to read a PDF
+   * over the wire — and a `RangedSource` is a plain object carrying a pdf.js
+   * transport. With no `prepare`, `#openBook` cast it `as File | string` and
+   * handed it to `view.open`, which sniffs a type it does not have and answers
+   * "this file could not be opened": a message that sends the reader to look at
+   * the book when the mistake was at the call site.
+   *
+   * The pass-through is one line, so requiring it costs a caller nothing and
+   * makes the cast below provably safe. Optional dependencies whose absence
+   * recreates the failure they exist to prevent are not defaults — see
+   * `applyVars` just below, which is required for the same reason.
+   */
+  prepare: (source: BookSource) => Promise<unknown>
+  /**
+   * Why the OPENED book must not be shown, or null.
+   *
+   * Asked after `view.open` and before `init` — the fork has parsed the
+   * archive by then and loaded no section yet, so the answer costs one small
+   * read and a refused book never puts a page of ciphertext on screen. See
+   * `protection.ts` for what it decides and why the rule is narrow.
+   *
+   * Injected rather than imported so the session's lifecycle tests, which
+   * run with no DOM, can hand it a verdict; REQUIRED, on the same reasoning as
+   * `prepare` above — a caller that left it out would reopen exactly the
+   * failure it exists to prevent, a DRM'd book rendered as noise.
+   */
+  protection: (book: OpenedBook) => Promise<string | null>
+  applySettings: (view: View) => void
+  /**
+   * The reader's settings, as custom properties on ONE document's root.
+   *
+   * SEPARATE FROM `applySettings` BECAUSE IT IS PER DOCUMENT, NOT PER VIEW.
+   * The two sheets are static and read `var(--carta-*)`; the values live inline
+   * on each document's `:root`, which is what lets an attribute-presence
+   * selector switch a whole tier and what stops a settings change re-parsing
+   * the sheet. Every document that shows the book's text needs it: each section
+   * as it loads, and the note popover's own document, which is rendered in a
+   * view this session did not build.
+   *
+   * REQUIRED, unlike `styleNote`. A document that misses this has no
+   * `--carta-line`, so every `calc(var(--carta-line) * 1.5)` in the sheets is
+   * invalid at computed-value time and drops — an unstyled book, with nothing
+   * logged. A required dep is the compiler saying so at the call site.
+   */
+  applyVars: (doc: Document) => void
+  /**
+   * The reader's typography, for a NOTE's view.
+   *
+   * Separate from `applySettings` because a note is not a page: it takes the
+   * same stylesheet plus one rule a page must not have — see `styleNoteView`.
+   * Optional, so a caller that only reads books needs no opinion about notes.
+   */
+  styleNote?: (view: View) => void
+  /**
+   * Where this book was last left, if anywhere.
+   *
+   * A getter, and read at the LAST possible moment — after the book has been
+   * parsed — because the saved position is keyed by the book's content-derived
+   * id, which resolves asynchronously alongside the open. Reading it when the
+   * session is constructed would be reading it before it can be known.
+   *
+   * Returning null means the start of the book, which is also what a position
+   * the book no longer contains falls back to. See `#display`.
+   */
+  lastLocation?: () => string | null
+}
+
+/**
+ * `Node.ELEMENT_NODE`, spelled as its value.
+ *
+ * This module's tests run in plain node with no DOM — see `session.test.ts` —
+ * so the `Node` global is not there to read the constant off. The suite caught
+ * it immediately, which is the argument for keeping those tests DOM-free.
+ */
+const ELEMENT_NODE = 1
+
+/** `Node.DOCUMENT_NODE`, spelled as its value, for the reason above. */
+const DOCUMENT_NODE = 9
+
+/**
+ * A prepared book that owns resources of its own.
+ *
+ * `View.close()` closes the RENDERER; it knows nothing about a book object the
+ * app synthesised, so a PDF's object URLs and its pdf.js loading task — worker
+ * and transport included — survived every close and accumulated one set per
+ * book opened. The session owns what it prepared, so it destroys it too.
+ */
+interface Destroyable {
+  destroy: () => void
+}
+
+function destroyable(value: unknown): value is Destroyable {
+  return typeof (value as Destroyable | null)?.destroy === 'function'
+}
+
+export class ReaderSession {
+  #disposed = false
+  #view: View | null = null
+  /** One per session — a gesture can span a spine boundary. See `#watchWheel`. */
+  readonly #pager = wheelPager()
+  /**
+   * The next page to load was reached by scrolling BACKWARDS, so open its foot.
+   *
+   * Only ever set for a fit-width fixed-layout book, where one page is one
+   * section and scrolling is the reading motion. Without it, scrolling up at the
+   * head of a page loads the previous one at ITS head — so the reader is at the
+   * top again, scrolls up again, and skips backwards through the book without
+   * seeing any of it. Reading forwards has no equivalent problem, because the
+   * head of the next page is where it should start.
+   *
+   * A TIME rather than a boolean, because arming it is not proof that anything
+   * will load. `prev()` at the very first page navigates nowhere, and a
+   * fixed-layout renderer can move within a spread without emitting `load` — so
+   * a plain flag could stay armed indefinitely and then send some unrelated
+   * later page, reached by a tap in the contents, to its foot. Bounding it keeps
+   * the worst case inside the moment the gesture happened.
+   */
+  #enterAtFootAt: number | null = null
+  #painters: MarkPainters | null = null
+  /**
+   * Sections that currently have an overlay.
+   *
+   * Marks can only be drawn into a section that has one, so this is what
+   * `redrawMarks` iterates after a theme change — re-offering marks for a
+   * section that has been scrolled away would resolve CFIs for nothing.
+   */
+  readonly #sections = new Set<number>()
+  /**
+   * The foreign anchors currently painted in each live section.
+   *
+   * ⚠️ **A WITHDRAWAL HAS NO ERASE CALL, so a redraw is the only chance to
+   * remove one.** The reader's own marks are erased by name — `eraseMark`,
+   * called when the reader deletes one. A foreign passage disappears from the
+   * OTHER side: somebody unshares, the capability's next answer omits it, and
+   * `#drawSection` was purely additive — so the friend's underline stayed on
+   * the page for the rest of the session, and came back on every redraw.
+   * Un-sharing that leaves the mark up is worse than no un-sharing at all,
+   * because the reader is told it is gone.
+   *
+   * Keyed by section, and by the overlay key within it — the key
+   * `useOverlays` composes, so `n` readers on one passage are `n` entries and
+   * one of them going away does not erase the others.
+   */
+  readonly #foreignDrawn = new Map<number, Map<string, ForeignAnchor>>()
+  /**
+   * Sections with a reconciliation in flight, and whether one is owed after it.
+   *
+   * Present means running; `true` means the answer changed while it ran, so
+   * the pass goes round again from the CURRENT answer. See `#reconcileForeign`.
+   */
+  readonly #reconciling = new Map<number, boolean>()
+  /**
+   * Per-document listener teardown, keyed by the document itself.
+   *
+   * A Map rather than an array, because an array only grows: foliate loads a
+   * new document for every section the reader passes through, so a long book
+   * accumulated one closure per section — each retaining its document, and for
+   * a PDF the page canvas with it — until the book was closed. Keying by
+   * document means re-loading one replaces its entry, and a WeakRef is
+   * unnecessary because the entry is dropped explicitly.
+   */
+  readonly #unwatch = new Map<Document, (() => void)[]>()
+  /** Which spine item each live document is, so a per-document redraw can find
+   *  the one section it needs to touch. */
+  readonly #indexOf = new WeakMap<Document, number>()
+
+  /**
+   * The section most recently RENDERED, as the fallback for "where is the
+   * reader" when a relocation reports no range of its own.
+   *
+   * A fallback and not the answer: see `ReaderPosition.sectionIndex` for the
+   * boundary case that makes the range's own document the better source when
+   * there is one. Every fixed-layout book takes this path, because `foliate-fxl`
+   * reports no range at all.
+   */
+  #renderedIndex: number | null = null
+
+  /**
+   * Every section currently rendered — not just the last one.
+   *
+   * `#renderedIndex` says which loaded MOST RECENTLY, and that is the same
+   * thing as "the one on screen" only when there is one. `#sections` cannot
+   * answer this: it is filled on `create-overlay`, which is annotation
+   * plumbing, and a book with nothing to draw never fills it at all. This is
+   * filled on `load` and emptied by the same teardown, so its size is the
+   * count of live documents — which is what tells a single page apart from a
+   * spread, and a scrolled flow showing one section apart from one showing two.
+   */
+  readonly #rendered = new Set<number>()
+
+  /**
+   * The last relocation, as ONE value: where it was, which section, and the
+   * range it covered.
+   *
+   * HELD RATHER THAN PUBLISHED, and that is the point of keeping it. The range
+   * is what a bookmark's remembered text and context are read out of, and
+   * reading them costs a walk of the page's text nodes. Doing that on every
+   * relocation would put it on every page turn, for a value almost every turn
+   * throws away; doing it in `placeHere` puts it on the press of ⌘B, which
+   * happens when the reader asks for it.
+   *
+   * ONE FIELD RATHER THAN THREE, and that is not tidiness. `placeHere` used to
+   * take the CFI from its caller — the host holds one, it arrives on
+   * `ReaderPosition` — and pair it with whatever range this session had most
+   * recently seen. Those two are updated on different schedules: the host's
+   * copy lands when React commits, this one when the event fires. Between a
+   * relocation and that commit they describe different pages, so a bookmark
+   * made in that window carried the previous page's anchor with this page's
+   * section and text. Stored together, they cannot disagree.
+   *
+   * The range stays live, so it may have been detached by the time it is read —
+   * a section re-render replaces the nodes under it. `placeHere` checks before
+   * trusting it, exactly as `publish` does for a selection.
+   */
+  #relocated: {
+    cfi: string | null
+    sectionIndex: number | null
+    /** Whether the section came from a source that KNOWS — see `#sectionOf`. */
+    sectionExact: boolean
+    chapter: string
+    range: Range | null
+  } | null = null
+
+  /**
+   * The document whose selection is currently on screen, or null.
+   *
+   * Session-level because a fixed-layout spread has TWO live documents, each
+   * running its own `#watchSelection`. This used to be a `published` boolean
+   * inside each closure, so both could believe they owned the popup: selecting
+   * in the left page then the right left the left one still flagged, and the
+   * next repaint or collapse over there took down the right page's newer
+   * selection. Ownership is single by construction now — publishing transfers
+   * it, and only the holder may clear.
+   */
+  #selectionOwner: Document | null = null
+  /**
+   * How to select a range and publish it, per section.
+   *
+   * The publishers are built per section inside `#watchSelection`, where they
+   * close over the section's document, its index and the view — and clicking a
+   * MARK arrives on a view-level event that has none of them. Rather than
+   * rebuild a second publisher out of the same parts, which is how two answers
+   * to "what is selected" come to disagree, the one that already exists is
+   * registered here.
+   *
+   * KEYED BY INDEX, because that is what `show-annotation` carries. Keying by
+   * document would mean recovering one from the range's `ownerDocument`, which
+   * is an inference where the event already holds the answer.
+   */
+  readonly #selectors = new Map<number, (range: Range) => void>()
+  /** A book this session synthesised, which `View.close()` will not release. */
+  #prepared: Destroyable | null = null
+  /**
+   * The rendered note's view, so it can be released on dismiss.
+   *
+   * Typed as `View`, not `HTMLElement`: releasing it means calling `close()`
+   * to unobserve the paginator before detaching, and a bare element type hides
+   * that method — which is how it came to be detached without being closed.
+   */
+  #footnoteView: View | null = null
+  /**
+   * Which note the reader is waiting for.
+   *
+   * Every click takes the next number and carries it in its own `NoteRequest`;
+   * anything arriving under an older one is released rather than shown. That
+   * retires a note superseded by a newer click, and a note still rendering when
+   * the reader closed the flow — `closeFootnote`, `#noteFailed` and `dispose`
+   * all advance it, which is how "nothing is pending" is expressed.
+   *
+   * ⚠️ **THIS USED TO BE HALF OF A PAIRING SCHEME, and the other half was a
+   * FIFO queue.** The anchor was queued at the click and shifted off at
+   * `before-render`, which pairs by arrival rather than by identity — see
+   * `NoteRequest`. Two consequences, both real: two notes in flight could
+   * cross, and a `before-render` arriving with the queue EMPTY (the reader had
+   * closed the note) fell back to `{ at: null, seq: <current> }`, which then
+   * passed this very check and reopened the note they had just dismissed. A
+   * request that owns its own listeners has neither.
+   */
+  #noteSeq = 0
+  /**
+   * The box a note is rendered into, owned by the host.
+   *
+   * IT MAY NEVER MOVE. A `foliate-view` holds an iframe and re-parenting an
+   * iframe reloads it — which discarded the extracted note and restored the
+   * whole chapter, with nothing raised. So the host registers one container up
+   * front and every note is appended into it in place.
+   */
+  #footnoteMount: HTMLElement | null = null
+
+  /**
+   * The box the popover is POSITIONED IN — the origin its anchor rects use.
+   *
+   * NOT DERIVED FROM THE MOUNT, and that distinction cost the feature entirely.
+   * The mount is a child of the popover and the popover is `position:
+   * absolute`, so `mount.offsetParent` is the POPOVER — parked off-screen at
+   * `left: -99999` while a note measures, which made every anchor read as a
+   * hundred thousand pixels away, which `place` correctly called `detached`,
+   * which hid the note. The component knows which box its `left` and `top`
+   * resolve against; nothing else can work it out. See `noteSpace`.
+   */
+  #footnoteSpace: HTMLElement | null = null
+
+  /** See `SessionDeps.styleNote`. Held from `start`, used on every note. */
+  #styleNote: ((view: View) => void) | null = null
+  /** See `SessionDeps.applyVars`. Held from `start`, used on every document. */
+  #applyVars: ((doc: Document) => void) | null = null
+  readonly #host: HTMLElement
+  readonly #cb: SessionCallbacks
+
+  constructor(host: HTMLElement, callbacks: SessionCallbacks) {
+    this.#host = host
+    this.#cb = callbacks
+  }
+
+  get disposed(): boolean {
+    return this.#disposed
+  }
+
+  /** The live view, or null before startup completes / after disposal. */
+  get view(): View | null {
+    return this.#view
+  }
+
+  /**
+   * Hand a freshly-created view to the latch.
+   *
+   * Returns false when the session was disposed while the caller was awaiting,
+   * having already closed the view it was given. Callers must stop on false —
+   * that is the whole contract.
+   */
+  #settle(view: View): boolean {
+    if (this.#disposed) {
+      closeQuietly(view)
+      return false
+    }
+    this.#view = view
+    return true
+  }
+
+  /**
+   * Bring a book up, from nothing on screen to a first page.
+   *
+   * Five steps, each its own method below. They were one 136-line function, and
+   * the length was not the problem — the RESPONSIBILITIES were: acquiring
+   * resources, mounting DOM, binding events, opening the book and publishing an
+   * API each fail differently and each has its own rollback, and reading which
+   * `return` left which of them half-done meant holding all five in your head
+   * at once. The disposal latch is checked between every pair, because each
+   * step contains an await the caller can unmount across.
+   */
+  async start(source: BookSource, deps: SessionDeps): Promise<void> {
+    const view = await this.#acquire(deps)
+    if (!view) return
+
+    this.#mount(view)
+    /* HELD, because notes are styled long after this returns. `#watchOneNote`
+       is wired at each click and fires whenever a reader opens a note, by which
+       time `deps` is three call frames gone. */
+    this.#styleNote = deps.styleNote ?? null
+    this.#applyVars = deps.applyVars
+    this.#bind(view)
+
+    if (!(await this.#openBook(view, source, deps))) return
+
+    this.#publish(view, deps)
+    await this.#display(view, deps)
+  }
+
+  /**
+   * The view and the painters, or null if either failed.
+   *
+   * `allSettled`, not `all`: `all` rejects the moment either side fails while
+   * the other keeps going, so a painters failure would strand a perfectly good
+   * view with nothing holding a reference to close it — the same leak this
+   * class exists to prevent, reintroduced one layer up.
+   */
+  async #acquire(deps: SessionDeps): Promise<View | null> {
+    const [built, painted] = await Promise.allSettled([
+      deps.createView(),
+      deps.loadPainters(),
+    ])
+
+    if (built.status === 'rejected') {
+      if (!this.#disposed) {
+        this.#cb.onError(message(built.reason, 'The reader failed to start.'))
+      }
+      return null
+    }
+    const view = built.value
+    if (!this.#settle(view)) return null
+
+    if (painted.status === 'rejected') {
+      // The view is settled, so dispose() will close it — the same contract as
+      // a failed open, where the book stays closable.
+      this.#cb.onError(message(painted.reason, 'The reader failed to start.'))
+      return null
+    }
+    this.#painters = painted.value
+    return view
+  }
+
+  /** Put the view in the host, filling it. */
+  #mount(view: View): void {
+    view.style.position = 'absolute'
+    view.style.inset = '0'
+    this.#host.replaceChildren(view)
+  }
+
+  /**
+   * Subscribe to everything the view emits.
+   *
+   * Every listener consults the latch before touching shared state. A closing
+   * view still emits these, and without the guard a dying book overwrites the
+   * document and position of the one that replaced it.
+   */
+  #bind(view: View): void {
+    view.addEventListener('load', (event) => {
+      if (this.#disposed) return
+      const { doc, index } = (event as CustomEvent<LoadDetail>).detail
+      /* FIRST, before a watcher, a mark or a measurement reads it: the
+         loader refuses a script RESOURCE, and leaves inline scripts and
+         `on*` handlers to whoever receives the document — its own source
+         says so. That is here. */
+      stripScripts(doc)
+      // A section re-loaded is the same document with fresh content, so its
+      // previous listeners are dropped before new ones go on — otherwise every
+      // return to a section doubles them.
+      this.#resetWatchers(doc)
+      this.#openAtFootIfArrivedBackwards()
+      this.#watchSelection(doc, view, index)
+      this.#watchKeys(doc)
+      this.#watchWheel(doc)
+      this.#watchDrops(doc)
+      /* The overlay for this section dies with its document, so the section
+       * leaves the live set at the same moment. Without this the set only ever
+       * grew: a redraw after a theme change then re-resolved a CFI into every
+       * section the reader had ever passed through, against overlays that no
+       * longer exist — work that rises with the length of the reading session
+       * and accomplishes nothing after the first few. */
+      this.#indexOf.set(doc, index)
+      this.#renderedIndex = index
+      this.#rendered.add(index)
+      this.#onTeardown(doc, () => {
+        this.#sections.delete(index)
+        this.#rendered.delete(index)
+        /* The overlay died with the document, and so did everything painted
+           into it. Remembering it would ask the section's NEXT overlay — a
+           fresh one that never held any of it — to remove marks it does not
+           have. */
+        this.#foreignDrawn.delete(index)
+        /* AND `#renderedIndex` STOPS NAMING A DOCUMENT THAT IS GONE.
+         *
+         * It was left pointing at the torn-down section, so after the most
+         * recently loaded of two was dropped it named a document nothing could
+         * resolve while the other was still on screen — a fallback section for
+         * a page the reader is not on, reported as confidently as any other.
+         * The remaining insertion order is the next best answer, and null when
+         * there is nothing left is the honest one. */
+        if (this.#renderedIndex === index) {
+          const remaining = [...this.#rendered]
+          this.#renderedIndex = remaining[remaining.length - 1] ?? null
+        }
+      })
+
+      /* A NEW SECTION CLOSES THE NOTE. The popover is placed against a
+         reference that has just been replaced, so leaving it up would leave it
+         pointing at whatever now occupies those coordinates. */
+      this.closeFootnote()
+
+      /* BEFORE ANYTHING MEASURES THIS DOCUMENT. The sheets are already in —
+         foliate writes them in the same `onLoad` that dispatches this event —
+         but they read `var(--carta-*)`, and until the contract is on the root
+         every length in them is invalid and drops. `markProse` below reads
+         computed styles, and it would be reading an unstyled document. */
+      this.#applyVars?.(doc)
+      this.#redrawWhenFontsLand(doc)
+      ensureLang(doc, view)
+      this.#cb.onDirection(directionOf(doc))
+      /* AFTER the book's own stylesheet has applied, which by this point it
+         has: the mark records what the BOOK asked for, and reading it before
+         the author's rules landed would mark centred paragraphs as prose. */
+      markProse(doc)
+      /* Beside `markProse`, and after the book's stylesheet for the same
+         reason: which images are figures is a question about the DOCUMENT, and
+         the answer is written as an attribute so the sheet can select on it.
+         `matteFigures` follows because it only looks at what this marked. */
+      markFigures(doc)
+      matteFigures(doc)
+      /* Beside the other two, and after the book's stylesheet for the same
+         reason: how small a piece of text is relative to the base is a question
+         about the DOCUMENT, and it can only be asked once the author's rules
+         have landed. See markSmallText for why the accessibility floor cannot
+         be a rule on its own. */
+      markSmallText(doc)
+      /* Beside `markProse`, and for the same reason it is here: this reads the
+         BOOK'S OWN rules, so the author's stylesheet has to have landed. See
+         `suppressEmptyGeneratedContent` — the box it deletes was appearing over
+         the page, not only inside the note popover. */
+      suppressEmptyGeneratedContent(doc)
+
+      this.#cb.onDocument(doc)
+    })
+
+    /* Every link in the book, before foliate navigates — see `LinkDetail`.
+     * Cancelable, so the host decides; the session only carries it across.
+     *
+     * A FOOTNOTE IS OFFERED TO THE HANDLER FIRST, and if it takes the link it
+     * calls `preventDefault()` in this same turn, which is what stops foliate
+     * navigating. Anything it declines falls through to the host unchanged and
+     * goes on navigating exactly as it always has — the fallback is what
+     * happens when nothing is written, not something written. */
+    view.addEventListener('link', (event) => {
+      if (this.#disposed) return
+      const detail = (event as CustomEvent<LinkDetail>).detail
+      const taken = this.#openFootnote(view, detail, event)
+      if (!taken) this.#cb.onLink(detail, event)
+    })
+
+    view.addEventListener('external-link', (event) => {
+      if (this.#disposed) return
+      this.#cb.onExternalLink((event as CustomEvent<ExternalLinkDetail>).detail, event)
+    })
+
+    /* foliate builds one overlay per spine item, and rebuilds it every time the
+     * section is re-rendered. This is the only moment a mark can be attached,
+     * which is why the store is read through a getter rather than captured. */
+    view.addEventListener('create-overlay', (event) => {
+      if (this.#disposed) return
+      const { index } = (event as CustomEvent<CreateOverlayDetail>).detail
+      this.#sections.add(index)
+      this.#drawSection(view, index)
+    })
+
+    view.addEventListener('draw-annotation', (event) => {
+      if (this.#disposed) return
+      /* The shared declaration, not a copy. These shapes were written out
+       * inline here and declared again in `vite-env.d.ts`, and the two had
+       * already drifted — this one made `annotation.value` optional where the
+       * declaration requires it, which is the difference between a guard that
+       * is load-bearing and one that is noise. */
+      const detail = (event as CustomEvent<DrawAnnotationDetail>).detail
+      const painters = this.#painters
+      if (!painters) return
+      /* REPORTED AFTER THE PAINT, not before it. This fired as soon as the
+       * event arrived, so a painter that threw — or a kind the whitelist below
+       * refuses — still registered a live Range in the margin's cache. The
+       * margin then measured and drew a control beside a highlight that is not
+       * on the page. `drawn` is called at the end of each branch that actually
+       * paints. */
+      const drawn = () => {
+        if (detail.annotation?.value && detail.range) {
+          this.#cb.onMarkDrawn(detail.annotation.value, detail.range)
+        }
+      }
+      const palette = this.#cb.getPalette()
+      /* The book document travels with the draw options so the highlight
+       * painter can read the font the rects were measured in — see
+       * `balanceRects`. Taken from the range rather than added to the event
+       * type, because the range is already in hand and cannot disagree. */
+      /* From the EVENT, not rebuilt from the range. `startContainer` can be a
+       * Document when a range spans a whole node, and `ownerDocument` on a
+       * Document is null — so the reconstruction lost exactly the case it was
+       * meant to cover. */
+      const doc = detail.doc ?? detail.range?.startContainer?.ownerDocument ?? null
+      /* The element the marked words are in, so the band is measured against
+       * the font they are actually drawn in rather than the book's default —
+       * a mark in a heading or a code span is not body text. */
+      const container = detail.range?.startContainer ?? null
+      const at =
+        container && container.nodeType === ELEMENT_NODE
+          ? (container as Element)
+          : (container?.parentElement ?? null)
+      /* ⚠️ **EVERY RULE PAINTER READS THIS, AND NONE OF THEM WERE TOLD.**
+       * foliate's `underline`, `strikethrough` and `squiggly` each take
+       * `writingMode` and put the rule on the block's far edge — under the
+       * words horizontally, beside the column in a vertical book. Omitted, the
+       * default is horizontal, so in a `vertical-rl` book every rule Carta
+       * draws — the reader's own, the companion's wave, and a friend's — is
+       * struck across the text instead of alongside it. The fill painter is
+       * the only one that noticed vertical writing, and it noticed in order to
+       * bail (`balanceRects`); the three that could simply have been told were
+       * the ones left wrong. */
+      const writingMode = writingModeAt(doc, at)
+      /* §01 SAID AMBER UNDERLINE, and this is an amber WAVE — the one place
+       * this file departs from the section it implements, deliberately.
+       * The underline was provenance back when the reader's own mark was
+       * always a gold fill: shape and colour both said whose it was. Once the
+       * reader could draw rules too, an amber rule and a yellow rule were two
+       * pixels and a hue apart. The wave is reserved to the companion now
+       * (`READER_STYLES` is what enforces it), so the shape carries the
+       * provenance again — and a squiggle is what every spell checker on earth
+       * uses to say "something automated has an opinion here", which is what a
+       * companion's claim is.
+       * Not a style the reader picks, either way. Everything else is the
+       * reader's own tint and their own choice of band or rule.
+       *
+       * The three values ride along on the annotation so the painter does not
+       * have to look the mark up again: `annotation` carries whatever
+       * `annotationFor` put on it, and reading the store from in here would be
+       * a second answer to "what does this mark look like", resolved at a
+       * different moment from the first. */
+      /* WHAT MAY BE DRAWN, ASKED AS A WHITELIST. The next branch treats
+       * everything that is not the companion's as a reader's highlight, which
+       * classifies by exclusion — so a `bookmark` arriving here would be
+       * painted as a gold band over a passage the reader never marked. The
+       * compile-time split makes that unreachable today: `getMarks` hands over
+       * annotations and `MarkAnchor.kind` is `AnnotationKind`. This is the same
+       * defensiveness the comment below asks for, applied to the field that
+       * decides which painter runs rather than only to the ones that decide
+       * what colour it is — foliate round-trips this object untyped, so the
+       * value arriving here is not the value the type system saw. */
+      /* ⚠️ **A WHITELIST THAT ONLY REFUSED STRINGS IS NOT A WHITELIST.** The
+       * test was `typeof kind === 'string' && !includes(kind)`, so a `kind`
+       * that was absent, `null` or a number fell PAST it and was painted by
+       * the final branch as a yellow fill — a band over a passage the reader
+       * never marked, which is the exact defect the comment above describes
+       * for `bookmark`. Every mark this code draws sets `kind` (`annotationFor`
+       * takes it from a required field), so nothing legitimate arrives without
+       * one; foliate round-trips the object untyped, which is why the check
+       * has to hold for values the type system never saw. */
+      const kind = detail.annotation?.kind
+      if (typeof kind !== 'string' || !(PAINTABLE_KINDS as readonly string[]).includes(kind)) {
+        return
+      }
+      if (kind === 'companion') {
+        detail.draw(painters.wave, { color: palette.companion, writingMode })
+        drawn()
+        return
+      }
+      if (kind === FOREIGN_KIND) {
+        /* ⚠️ **AN UNDERLINE, IN ONE HUE, WITH WEIGHT CARRYING MULTIPLICITY.**
+         * The reader's three tints say what THEY meant by a passage; a
+         * friend's mark must not claim that vocabulary, so it gets none of
+         * them and the colour is not a preference — it is what says whose mark
+         * this is. The companion's amber rule is the precedent and the same
+         * sentence covers both.
+         *
+         * A RULE and not a fill, because the central case is several people on
+         * one sentence and fills stack illegibly. Weight is then the only
+         * channel left, which is what makes "4 of 11 readers marked this"
+         * readable without a click. */
+        detail.draw(painters.underline, {
+          color: palette.foreign,
+          width: foreignWeight(readersOf(detail.annotation?.['readers'])),
+          writingMode,
+        })
+        /* ⚠️ **NOT `drawn()` — A FOREIGN PASSAGE IS NOT ONE OF THE READER'S
+         * MARKS.** `onMarkDrawn` fills the map `useMarking` describes as
+         * *"ranges for the marks foliate has drawn"*, which the margin
+         * measures to place a control beside each one. Reporting a friend's
+         * underline put an entry there for a CFI the reader has no mark at,
+         * and nothing ever took it out again: `forgetRange` is called from
+         * `unmark`, and a foreign passage is never unmarked. So the map grew a
+         * Range per foreign mark per redraw, each retaining the DOM it points
+         * into, for as long as the book stayed open. */
+        return
+      }
+
+      /* Read defensively. `Annotation` carries arbitrary values through
+       * foliate untyped, and an annotation from an older build — or one
+       * foliate has round-tripped — has neither field. Falling back to the
+       * same default `validMarks` uses keeps one answer for "an old mark". */
+      const tint = tintOf(detail.annotation?.['tint'])
+      const style = styleOf(detail.annotation?.['style'])
+      /* THE FILL COLOUR FOR A BAND, THE RULE COLOUR FOR A LINE, which is the
+       * whole reason each tint is a pair: a fill saturated enough to read as a
+       * 2px line makes its own words unreadable, and a rule pale enough to sit
+       * behind text is not a line, it is a smudge. */
+      if (style === 'fill') {
+        detail.draw(painters.fill, { color: palette.fill[tint], doc, at })
+      } else {
+        detail.draw(painters[style], { color: palette.rule[tint], writingMode })
+      }
+      drawn()
+    })
+
+    /**
+     * Clicking a mark SELECTS the passage it covers.
+     *
+     * Which is what puts the selection tools over it — the reader's way to
+     * recolour a highlight, restyle it, note it, copy it or take it off is the
+     * same bar they made it with, rather than a second set of controls
+     * somewhere else that would have to be kept in step with the first.
+     *
+     * A REAL SELECTION, not a snapshot assembled from the mark's stored fields.
+     * Both would put the bar in the right place; only this one comes down
+     * again. A synthesised selection is not the document's, so nothing in the
+     * document contradicts it: the next click lands somewhere else, the
+     * `selectionchange` listener sees no live selection and publishes null —
+     * which would be right if the bar were showing a real selection and is
+     * merely a race against the fake one. Selecting for real puts the popup on
+     * the same footing as every other selection there is, including the way it
+     * goes away.
+     *
+     * `show-annotation` carries the live `range` and the section `index`
+     * alongside the anchor, so nothing has to be resolved to do this.
+     */
+    view.addEventListener('show-annotation', (event) => {
+      if (this.#disposed) return
+      const { index, range } = (
+        event as CustomEvent<{ value: string; index: number; range?: Range }>
+      ).detail
+      /* No range means the anchor did not resolve — `showAnnotation` emits that
+       * way for a CFI it could not find. Selecting nothing would leave the bar
+       * hanging off a passage that is not there. */
+      if (!range) return
+      /* SELECTED AND PUBLISHED NOW rather than left to the `pointerup` snap
+       * that this same click already scheduled. That snap would publish the
+       * range too, a macrotask later and widened to whole words — so the bar
+       * would arrive late, against an anchor that is not the mark's own. */
+      this.#selectors.get(index)?.(range)
+    })
+
+    view.addEventListener('relocate', (event) => {
+      if (this.#disposed) return
+      const detail = (event as CustomEvent<RelocateDetail>).detail
+      const cfi = detail.cfi ?? null
+      const section = this.#sectionOf(detail)
+      const sectionIndex = section.index
+      const chapterLabel = detail.tocItem?.label ?? ''
+      /* Held as one value for `placeHere`, which is the only thing that reads
+       * the page's text — and reads it on demand rather than here. Captured
+       * together so a bookmark cannot pair one page's anchor with another
+       * page's section. See the field. */
+      this.#relocated = {
+        cfi,
+        sectionIndex,
+        sectionExact: section.exact,
+        chapter: chapterLabel,
+        range: detail.range ?? null,
+      }
+      this.#cb.onRelocate({
+        fraction: detail.fraction,
+        chapterLabel,
+        chapterHref: detail.tocItem?.href ?? '',
+        // Carried through rather than dropped, which is what this handler used
+        // to do with it. It is what `lastLocation` below is given back.
+        cfi,
+        sectionIndex,
+        sectionExact: section.exact,
+      })
+    })
+  }
+
+  /**
+   * Parse the source and open it. False means stop — failed, refused or
+   * disposed.
+   *
+   * THREE OUTCOMES USED TO BE SILENT, or worse than silent (WI-20.13). A
+   * zero-length file reached the fork, whose words for it are "File not
+   * found". A DRM'd EPUB opened and rendered its chapters as noise, because
+   * the fork passes an algorithm it cannot decode through as ciphertext and
+   * nothing here asked. And a password-protected PDF showed pdf.js's own "No
+   * password given" — `makePdf` owns that one; its refusal arrives through
+   * the catch below with a sentence of its own.
+   */
+  async #openBook(view: View, source: BookSource, deps: SessionDeps): Promise<boolean> {
+    /* Before the fork sees it — see `isEmptySource`. */
+    if (isEmptySource(source)) {
+      this.#cb.onError(EMPTY_FILE)
+      return false
+    }
+    try {
+      /* REQUIRED — see `SessionDeps.prepare`. The cast at `view.open` below is
+         only sound because something has converted whatever this was into
+         something foliate accepts. */
+      const target = await deps.prepare(source)
+      // Held so disposal can release it — see `Destroyable`.
+      if (target !== source && destroyable(target)) {
+        /* Unless disposal already happened while the PDF was being parsed, in
+         * which case nothing will ever read this field again and the book has
+         * to be released here. It is the expensive case, too: parsing is the
+         * slow step, so the race is likeliest exactly when the object being
+         * dropped owns a worker and a set of object URLs. */
+        if (this.#disposed) destroyQuietly(target)
+        else this.#prepared = target
+      }
+      // `prepare` can be slow — a PDF is parsed here — so the latch is
+      // consulted before the view is touched with the result.
+      if (!this.#settle(view)) return false
+      await view.open(target as File | string)
+    } catch (cause) {
+      if (!this.#settle(view)) return false
+      this.#cb.onError(message(cause, 'This file could not be opened.'))
+      return false
+    }
+    if (!this.#settle(view)) return false
+
+    /* BEFORE ANY SECTION LOADS. The fork's loader asks its book, per
+     * resource, whether it may load it; the answer for a script is no — the
+     * CSP is the wall and this is what stands behind it (`bookScripts.ts`,
+     * WI-20.30). Wired here, between `open` and the first `init`, because a
+     * listener added later meets a chapter already loaded. */
+    refuseBookScripts(view.book)
+
+    /* OPENED IS NOT THE SAME AS READABLE. The container, the package and the
+     * navigation of a DRM'd EPUB are in the clear — that is why `open`
+     * succeeds and why nothing said anything — and the first section loaded
+     * is where the ciphertext would appear. Asked here, after the parse and
+     * before any section, so a refused book is never displayed at all: not a
+     * first page, not its contents, not a navigator. `dispose` closes it like
+     * any other open that stopped. */
+    const refused = await deps.protection(view.book)
+    if (!this.#settle(view)) return false
+    if (refused !== null) {
+      this.#cb.onError(refused)
+      return false
+    }
+    return true
+  }
+
+  /** Hand the book's contents and its navigation to the host. */
+  #publish(view: View, deps: SessionDeps): void {
+    this.#cb.onToc(view.book.toc ?? [])
+    this.#cb.onMeta(readMeta(view.book))
+    /* Not awaited, and not allowed to fail the open. Pulling a cover out means
+     * unzipping an image, which for a large book takes long enough to be worth
+     * not blocking the first paint on — and a malformed manifest that throws
+     * here is a book without a picture, not a book that failed to open. */
+    void (async () => {
+      /* A BACKEND THAT LACKS THE METHOD SAYS SO, because the optional call
+       * below cannot tell that apart from a book that simply has no picture —
+       * and that silence hid a real gap for as long as it existed. Carta's PDF
+       * adapter never implemented `getCover`, so every PDF fell through this
+       * line to the shelf's derived tint, which is a legitimate answer for a
+       * jacketless book and therefore looked like one. The costume fit so well
+       * that `BookCover`'s own comment explained the absence as inherent to the
+       * format. One line here is what makes the next missing backend a question
+       * somebody asks on the first run rather than months later. */
+      if (typeof view.book?.getCover !== 'function') {
+        console.warn('Carta: this book backend implements no getCover — no jacket will be filed')
+      }
+      /* `coverFrom`, not `.catch()` on the result: a backend may return the
+       * jacket synchronously — see the function, and the FB2 case that makes
+       * this not merely defensive. */
+      const cover = view.book ? await coverFrom(view.book) : null
+      if (!this.#disposed) this.#cb.onCover(cover ?? null)
+    })()
+    const navigate = navigationQueue(() => !this.#disposed, reportNavigation('navigate'))
+    this.#cb.onNavigator({
+      /* Every navigation reports its own failure. These are async and were
+       * discarded, so a target that will not resolve — a dead link in a table
+       * of contents, a PDF destination pointing at a page that is not there —
+       * surfaced as an unhandled rejection at the window rather than as a line
+       * saying which link it was. Nothing is shown to the reader: a link that
+       * goes nowhere should do nothing, not raise a dialog. */
+      goTo: (target) => navigate(() => view.goTo(target), true),
+      goToFraction: (frac) => {
+        const anyView = view as unknown as { goToFraction?: (f: number) => Promise<void>; goTo: (t: unknown) => Promise<void> }
+        if (typeof anyView.goToFraction === 'function') {
+          navigate(() => anyView.goToFraction!(frac), true)
+        } else {
+          navigate(() => anyView.goTo({ fraction: frac }), true)
+        }
+      },
+      search: (query, signal) => runSearch(view, query, signal),
+      // Reported, unlike the speculative offers made when an overlay is
+      // created: this one is a direct response to the reader marking something,
+      // so a failure is a mark that silently did not appear.
+      drawMark: (anchor) => attachMark(view, anchor, { report: true }),
+      eraseMark: (anchor) => attachMark(view, anchor, { remove: true, report: true }),
+      deselect: () => view.deselect(),
+      /* Bound to the SESSION, not to this closure's `view`: the method reads
+         `#view` and `#disposed`, so a navigator held past a teardown answers
+         with the honest empty rather than reaching into a dead renderer. */
+      passages: () => this.passages(),
+      closeFootnote: () => this.closeFootnote(),
+      setFootnoteMount: (mount, within) => this.setFootnoteMount(mount, within),
+      next: () => navigate(() => view.next()),
+      prev: () => navigate(() => view.prev()),
+      goLeft: () => navigate(() => view.goLeft()),
+      goRight: () => navigate(() => view.goRight()),
+      placeHere: () => this.placeHere(),
+      /* Bound to the SESSION for `passages`' reason — it reads `#view` and
+         `#disposed`, so a navigator held past a teardown answers with an empty
+         walk rather than parsing sections of a book nobody is reading. */
+      reanchor: (pending) => this.reanchorUnplaced(pending),
+    })
+
+    this.#cb.onFixedLayout(view.isFixedLayout)
+
+    // Settings go on BEFORE the first paint, so the reader never flashes
+    // foliate's defaults on the way to the configured layout.
+    deps.applySettings(view)
+  }
+
+  /**
+   * Listen for what ONE request's handler renders.
+   *
+   * PER CLICK, WITH THE REQUEST IN THE CLOSURE — see `NoteRequest` for the
+   * pairing defect this removes. The handler is built for one `handle` call
+   * and nothing else refers to it, so these two listeners die with it.
+   */
+  #watchOneNote(handler: FootnoteHandler, request: NoteRequest): void {
+    /* This request's view has been let go, so `render` has nothing left to do
+       with it. A `render` for a view already closed would otherwise close it
+       twice — tolerated by `releaseNoteView`, and still a teardown running
+       over a torn-down renderer. */
+    let released = false
+    /**
+     * ATTACH THE VIEW BEFORE IT RENDERS. This is what `before-render` is for,
+     * and ignoring it is not a missing nicety — it is a crash.
+     *
+     * `#showFragment` builds a detached `<foliate-view>`, opens the book in it,
+     * emits this, and only then calls `goTo`. A detached element has no layout,
+     * so the paginator's `columnize` reads `doc.documentElement` off a document
+     * that is not there and throws `null is not an object` — which escapes the
+     * handler's own promise chain and reaches the app's error boundary. The
+     * reader loses the book because a footnote was clicked.
+     *
+     * Off-screen rather than hidden: `visibility: hidden` still lays out, and
+     * the paginator needs a real size to column into. It is moved into the
+     * popover when `render` says the note is ready.
+     */
+    handler.addEventListener('before-render', (event) => {
+      const { view } = (event as CustomEvent<{ view: View }>).detail
+      /* A session disposed between the click and this event still owns the
+       * detached view foliate just built — nothing else will ever see it, so
+       * bailing bare leaked its renderer and every blob it held (audit round
+       * 1, #106). Released the same way `dispose` releases a rendered one.
+       *
+       * AND A CANCELLED REQUEST IS THE SAME SITUATION. The reader closed the
+       * note, or clicked another one, while this was resolving: nothing will
+       * ever show this view, so it is released here rather than attached,
+       * styled and mounted on the way to being discarded at `render`. This is
+       * the case the FIFO queue could not tell from a fresh one — it handed
+       * the arriving view the CURRENT sequence, which then passed `render`'s
+       * supersession check and reopened the note the reader had dismissed. */
+      if (this.#disposed || request.seq !== this.#noteSeq) {
+        released = true
+        releaseNoteView(view)
+        return
+      }
+      this.#watchNoteLinks(view)
+      this.#cleanNoteDocument(view)
+      /* BEFORE `goTo`, like everything else in here. `setStyles` writes into
+         the style element foliate appends after the book's own sheet, and the
+         note has to be laid out with the reader's size rather than re-laid out
+         after it — the popover measures the note's height to size its box, and
+         measuring a note that is about to change size is measuring the wrong
+         note. */
+      this.#styleNote?.(view)
+      /**
+       * SCROLLED FLOW, NOT PAGINATED, and this is what lets the box fit the
+       * note.
+       *
+       * The popover's view is a paginator like the reader's, which COLUMNIZES
+       * into whatever box it is given — so a box sized to the note's content
+       * simply reflows the text into a second column that is off-view. Sizing
+       * the box was built against a paginated note and withdrawn for exactly
+       * that: the measurement was right (43px for a one-line footnote, box
+       * 420×115) and the note disappeared.
+       *
+       * A note is not a page and should never have been paginated. In scrolled
+       * flow the content is one continuous column, `body.scrollHeight` means
+       * what it says, and a long endnote scrolls inside the box instead of
+       * hiding in column two.
+       *
+       * SET BEFORE `goTo`, which is why `before-render` is the only place this
+       * can happen: `flow` is what triggers the paginator to re-render, and
+       * `applyLayout` records that anything set after it lands too late.
+       */
+      const noteRenderer = view.renderer
+      /* NO PAGE MARGIN. The main view gets one from `applyLayout`; this one
+         was given no layout at all, so it kept foliate's default — which put
+         the note's iframe 48px below the top of its container and made every
+         attempt to fit the box show that empty band instead of the note.
+         Set BEFORE `flow`, which is what triggers the re-render: `applyLayout`
+         records that anything after it lands too late. */
+      noteRenderer?.setAttribute('margin', '0px')
+      noteRenderer?.setAttribute('gap', '0px')
+      noteRenderer?.setAttribute('max-column-count', '1')
+      noteRenderer?.setAttribute('flow', 'scrolled')
+
+      /* THE STYLESHEET OWNS THE SIZE when there is a mount, and this sets none.
+         An inline `height: 100%` here beat `.body > *` and resolved to zero
+         against an auto-height parent, so the note rendered correctly into a
+         box nobody could see — extraction working, popover 72px tall.
+         Only the FALLBACK is sized here, because there is no stylesheet rule
+         for a view parked on the host and the paginator cannot columnize a box
+         with no dimensions. */
+      const mount = this.#footnoteMount
+      if (!mount) {
+        view.style.cssText = [
+          'position:absolute',
+          'left:-99999px',
+          'top:0',
+          'width:400px',
+          'height:320px',
+        ].join(';')
+      }
+      ;(mount ?? this.#host).appendChild(view)
+      /* The one being replaced is CLOSED, not just detached — see
+         `#releaseFootnoteView`. Opening a second note while the first is up
+         would otherwise throw for exactly the reason dismissing one did.
+         Held after, so a note that never finishes rendering is still released:
+         `closeFootnote` and the next `render` both look here. */
+      this.#releaseFootnoteView()
+      this.#footnoteView = view
+    })
+
+    handler.addEventListener('render', (event) => {
+      if (this.#disposed || released) return
+      const detail = (event as CustomEvent<FootnoteRenderDetail>).detail
+      /* Superseded — a newer note was asked for, or the reader closed the
+       * flow, while this one rendered. Shown, it would replace the newer note
+       * and sit at the wrong anchor; released, the click that mattered wins.
+       * `before-render` will usually have released it already; this is the
+       * request that was still current then and is not now. */
+      if (request.seq !== this.#noteSeq) {
+        released = true
+        releaseNoteView(detail.view)
+        return
+      }
+      /* `before-render` already attached this one and released the last. */
+      this.#footnoteView = detail.view
+      this.#cb.onFootnote({
+        view: detail.view,
+        href: detail.href,
+        type: detail.type,
+        /* THIS REQUEST'S OWN ANCHOR, not whichever one came off a queue
+           first — the popover is positioned against the reference that was
+           clicked, and pairing by arrival could hand it another note's. */
+        at: request.at,
+      })
+    })
+  }
+
+  /**
+   * The note's own document gets the same treatment the page does.
+   *
+   * A note is rendered by `FootnoteHandler` into a view the session did not
+   * build, so NONE of what `#bind`'s `load` handler does to a page has ever
+   * reached it — the note has always been the book's raw CSS in a box. That is
+   * mostly right and deliberately left alone: a note should read as the book
+   * wrote it.
+   *
+   * This one is not a matter of taste. The book's dead tooltip drew its empty
+   * box inside the popover as readily as over the page, and a rule that is
+   * wrong on the page does not become right in a note.
+   */
+  #cleanNoteDocument(noteView: View): void {
+    noteView.addEventListener('load', (event) => {
+      if (this.#disposed) return
+      const { doc } = (event as CustomEvent<LoadDetail>).detail
+      /* A note is a document of the same book, loaded by the same loader. */
+      stripScripts(doc)
+      /* The note's document gets the contract too, and for the same reason the
+         page's does: the sheets it was handed at `before-render` are static and
+         read `var(--carta-*)` from the root. Without this the popover is the
+         11.2px note again, by a different route. */
+      this.#applyVars?.(doc)
+      /* AND THE SAME MEASUREMENT THE PAGE GETS. `applyVars` re-measures only
+         when the base MOVES, which on a freshly built note document it has
+         not — so without this call the accessibility floor was inert inside
+         every footnote popover, which is precisely where a book's smallest
+         text lives. */
+      markSmallText(doc)
+      suppressEmptyGeneratedContent(doc)
+    })
+  }
+
+  /** See `watchNoteLinks` — the order is the fix, and it is asserted there. */
+  #watchNoteLinks(noteView: View): void {
+    watchNoteLinks(noteView, {
+      onLink: (detail, event) => {
+        if (!this.#disposed) this.#cb.onLink(detail, event)
+      },
+      onExternalLink: (detail, event) => {
+        if (!this.#disposed) this.#cb.onExternalLink(detail, event)
+      },
+      close: () => this.closeFootnote(),
+      goTo: (href) => {
+        const reader = this.#view
+        if (this.#disposed || !reader) return
+        void reader.goTo(href).catch(reportNavigation('goTo', href))
+      },
+    })
+  }
+
+  /**
+   * Offer a link to the footnote handler; true when it took it.
+   *
+   * SYNCHRONOUS ANSWER, ASYNCHRONOUS NOTE. `handle` returns a promise when it
+   * took the link and `undefined` when it did not, and it has already called
+   * `preventDefault()` by then — so the caller knows immediately whether
+   * foliate will navigate, without waiting for the note to render.
+   */
+  #openFootnote(view: View, detail: LinkDetail, event: Event): boolean {
+    const book = view.book
+    if (!book) return false
+    /* A LINK OUT OF A NOTE IS NOT A LINK INTO ONE — see `isBacklink`, which
+       carries the whole rationale. Left to foliate, the `*` at the head of a
+       footnote opened a popover containing that same `*` and nothing else
+       (measured: 22px tall), and took away the only thing a backlink is for.
+       Declining hands it back to the ordinary link path, so it navigates to
+       the reference and `⌘[` comes back — which is what it should always have
+       done. */
+    if (isBacklink(detail.a)) return false
+    /* PDF IS NOT IN SCOPE and needs no branch to say so: `makePdf`'s adapter
+       has no `epub:type`, no ARIA role and no superscript, so the detection
+       declines it on its own rules. A format check here would be a second
+       answer to a question already answered. */
+    /* A SYNCHRONOUS THROW IS POSSIBLE, and it would land in foliate's own
+       event dispatch. `handle` calls `book.resolveHref(href)` BEFORE wrapping
+       it — `Promise.resolve(book.resolveHref(href))` evaluates the call first
+       — so a backend without that method throws rather than rejecting, and the
+       throw escapes into `#handleLinks`. Caught here and treated as a note
+       that would not open, which is the same outcome by a different route. */
+    /* THIS CLICK'S OWN HANDLER, AND ITS LISTENERS ARE ON BEFORE IT RUNS —
+       see `NoteRequest`. Registered first rather than after `handle` returns
+       because that ordering is then not something to reason about: a
+       `before-render` emitted anywhere in `handle`'s chain is already covered.
+       A handler that DECLINES the link emits nothing at all, so the listeners
+       simply go with it. */
+    const request: NoteRequest = {
+      at: anchorRectInHost(detail.a, this.#noteSpace()),
+      /* CLAIMED, NOT COMMITTED. A declined link must not supersede a note the
+         reader has open — following an ordinary link is not dismissing one —
+         so `#noteSeq` only advances once the handler has taken it. */
+      seq: this.#noteSeq + 1,
+    }
+    const handler = new FootnoteHandler()
+    this.#watchOneNote(handler, request)
+    let pending: Promise<void> | undefined
+    try {
+      pending = handler.handle(book, event)
+    } catch (cause) {
+      this.#noteFailed(view, 'that note could not be resolved', detail, event, cause)
+      return true
+    }
+    if (!pending) return false
+    this.#noteSeq = request.seq
+    void pending.catch((cause: unknown) => {
+      if (this.#disposed) return
+      /* ⚠️ **A STALE REJECTION USED TO CLOSE THE NOTE THAT REPLACED IT.**
+         `#noteFailed` dismisses the popover and navigates the reader to ITS
+         href — so an older request failing after a newer note had opened tore
+         down the newer note and sent the reader to the older note's target, a
+         place they had already moved on from. The same supersession the render
+         path applies, on the road that was missing it. */
+      if (request.seq !== this.#noteSeq) {
+        console.warn('Carta: a superseded note could not be shown in place', detail.href, cause)
+        return
+      }
+      this.#noteFailed(view, 'that note could not be shown in place', detail, event, cause)
+    })
+    return true
+  }
+
+  /**
+   * FALL BACK TO THE JUMP, DO NOT SWALLOW IT. A note that will not resolve or
+   * render in place is still a place in the book, and the reader asked to go
+   * there. `preventDefault` has already stopped foliate navigating, so this
+   * navigates instead — and tells the host first, so the origin is recorded
+   * from where the reader still is and `⌘[` brings them back. A control that
+   * silently does nothing is what WI-16 deleted.
+   *
+   * ONE HANDLER FOR BOTH FAILURE ROADS (audit round 1, #835): the synchronous
+   * throw and the rejected render had drifted — only one of them dismissed an
+   * open popover. Both now do: the flow is over, anything still in flight is
+   * superseded, and the popover a previous note left open closes before the
+   * jump.
+   */
+  #noteFailed(view: View, what: string, detail: LinkDetail, event: Event, cause: unknown): void {
+    console.warn(`Carta: ${what}`, detail.href, cause)
+    this.#noteSeq += 1
+    this.#cb.onFootnote(null)
+    this.#cb.onLink(detail, event)
+    void view.goTo(detail.href).catch(reportNavigation('goTo', detail.href))
+  }
+
+  /** See `noteSpace` — exported, because the choice is the whole of it. */
+  #noteSpace(): HTMLElement {
+    return noteSpace(this.#footnoteSpace, this.#host)
+  }
+
+  /** Where notes are rendered. Null puts them back on the host — see the field. */
+  setFootnoteMount(mount: HTMLElement | null, within: HTMLElement | null = null): void {
+    this.#footnoteMount = mount
+    this.#footnoteSpace = within
+  }
+
+  /** Close whatever note is open, and let go of the view it was rendered in. */
+  /** See `releaseNoteView` — the order is the fix. */
+  #releaseFootnoteView(): void {
+    const view = this.#footnoteView
+    this.#footnoteView = null
+    if (view) releaseNoteView(view)
+  }
+
+  closeFootnote(): void {
+    this.#releaseFootnoteView()
+    this.#noteSeq += 1
+    if (!this.#disposed) this.#cb.onFootnote(null)
+  }
+
+  /**
+   * Show where the reader left off, or the first section.
+   *
+   * `open` parses the book and attaches a renderer but navigates NOWHERE.
+   * Without this the view stays empty with a populated table of contents and no
+   * iframe, reporting no error to explain it.
+   *
+   * A saved position is UNTRUSTED input, even though this app wrote it: books
+   * are identified by hashing their ends, so a re-exported or re-encoded
+   * edition can inherit a position from a file whose spine it no longer
+   * matches. Losing the book over a stale bookmark is the worse of the two
+   * failures, so a failed restore is retried from the start and only a failure
+   * with no position to blame is reported to the reader.
+   *
+   * Be precise about what that retry is FOR, because foliate covers most of it
+   * already: `resolveNavigation` catches its own errors and returns nothing, so
+   * a CFI that cannot be resolved at all falls through to `showTextStart`
+   * inside `init` and never reaches this catch. What does reach it is a
+   * position that resolves to a section and then fails to RENDER — and that is
+   * the case where retrying is the difference between a book and an error.
+   */
+  async #display(view: View, deps: SessionDeps): Promise<void> {
+    const saved = deps.lastLocation?.() ?? null
+
+    /* Wrapped rather than thrown, so a book that fails BOTH attempts reports
+     * the second failure and not a stale first one. A bare `catch` variable
+     * cannot say "nothing failed" — a thrown `undefined` is indistinguishable
+     * from no throw at all. */
+    const show = async (at: string | null): Promise<{ cause: unknown } | null> => {
+      try {
+        await view.init({ lastLocation: at, showTextStart: true })
+        return null
+      } catch (cause) {
+        return { cause }
+      }
+    }
+
+    let failed = await show(saved)
+
+    if (failed && saved !== null && !this.#disposed) {
+      /* Loud, but not at the reader: they asked to read a book and they get
+       * one. Silence here would make a position that never restores look
+       * exactly like a book nobody had opened before. */
+      console.warn('Carta: the saved position could not be restored', failed.cause)
+      failed = await show(null)
+    }
+
+    if (!this.#settle(view)) return
+    if (failed) {
+      this.#cb.onError(message(failed.cause, 'This book could not be displayed.'))
+      return
+    }
+
+    /*
+     * ⚠️ **RESOLVED IS NOT DISPLAYED.** The retry above catches a RENDER that
+     * throws, and that is the rarer failure. The fork's `goTo` catches its own
+     * errors and resolves; the paginator no-ops on an index it cannot go to;
+     * a section that fails to load resolves `#display({})`. A stored CFI whose
+     * idref no longer resolves, a fake-CFI index past the section count on
+     * MOBI/FB2/CBZ, a landmark pointing at a missing file — each resolved
+     * `init` having displayed nothing, and the reader got a blank stage with a
+     * populated table of contents and no error anywhere.
+     *
+     * THE SIGNAL IS THE RELOCATION, AND IT NEEDS NO TIMER. Both renderers
+     * report where they landed BEFORE the navigation's promise settles: the
+     * paginator's `#afterScroll` runs synchronously inside `#scrollTo` on the
+     * navigation path, and the fixed-layout renderer's `#reportLocation` is
+     * the last line of `goToSpread`. So an `init` that resolves with no
+     * `relocate` behind it displayed nothing, and `#relocated` — set by that
+     * event and by nothing else — is the whole test.
+     *
+     * AND THE FALLBACK BYPASSES THE LANDMARKS. Retrying `init(null)` is not
+     * enough: `goToTextStart` prefers the bodymatter landmark, so a landmark
+     * whose href is missing fails the same silent way twice. The fallback goes
+     * to the first spine item with `linear !== 'no'` BY INDEX, which the
+     * paginator honours whatever the landmarks say. One navigation, one
+     * notice on the channel a lost position already uses — findable, and not
+     * an error bar over a book that is about to be readable. Only when that
+     * too lands nowhere is the reader told.
+     */
+    if (this.#relocated) return
+    const first = firstLinearSection(view.book)
+    if (first !== -1) {
+      console.warn(
+        saved !== null
+          ? 'Carta: the saved position displayed nothing; opening at the first section instead'
+          : 'Carta: the book opened to nothing; opening at the first section instead',
+      )
+      try {
+        await view.goTo(first)
+      } catch (cause) {
+        failed = { cause }
+      }
+      if (!this.#settle(view)) return
+      if (this.#relocated) return
+    }
+    this.#cb.onError(message(failed?.cause, 'This book could not be displayed.'))
+  }
+
+  /**
+   * Re-attach every mark in every live section.
+   *
+   * The Overlayer's own `redraw()` reuses the options each mark was added with,
+   * so it re-paints the old colour after a theme change. Re-adding is what
+   * actually re-reads the palette — `add()` drops an existing key first, so
+   * this updates in place rather than stacking a second copy.
+   */
+  redrawMarks(): void {
+    const view = this.#view
+    if (!view || this.#disposed) return
+    for (const index of this.#sections) this.#drawSection(view, index)
+  }
+
+  /**
+   * The book text on screen, as passages a companion answer can cite.
+   *
+   * WI-15.5's grounding, read from the live documents at the moment the
+   * question is asked — not cached, because the reader turns pages and an
+   * answer grounded in the page before is an answer about somewhere else.
+   *
+   * `renderer.getContents()` is THE ONLY WAY IN: both renderers call
+   * `attachShadow({ mode: 'closed' })`, so an embedder cannot reach the
+   * iframe from the DOM side at all.
+   *
+   * Empty rather than throwing when nothing is rendered — the companion then
+   * has nothing to cite and says so, which is the honest state before the
+   * first section loads.
+   */
+  passages(): readonly AskPassage[] {
+    const view = this.#view
+    if (!view || this.#disposed) return []
+    const renderer = view.renderer
+    if (!renderer) return []
+    try {
+      return screenPassages(renderer.getContents(), (index, range) => view.getCFI(index, range))
+    } catch {
+      /* A renderer mid-teardown, or one that has no contents to give. The
+         companion loses its grounding for this question, which the provider
+         reports; it must not take the reader's pane down with it. */
+      return []
+    }
+  }
+
+  /** Offer every mark belonging to one section to that section's overlay. */
+  #drawSection(view: View, index: number): void {
+    for (const anchor of this.#cb.getMarks()) {
+      if (anchor.sectionIndex !== index) continue
+      attachMark(view, anchor)
+    }
+    /* ⚠️ **AFTER the reader's own, which decides what sits on top.** The
+     * Overlayer paints in the order it was given, so a friend's rule drawn
+     * second sits over the reader's band rather than under it — and a rule
+     * under a band is a rule nobody can see. */
+    void this.#reconcileForeign(view, index)
+  }
+
+  /**
+   * Bring one section's foreign marks to what the overlay now says.
+   *
+   * ⚠️ **ONE AT A TIME PER SECTION, and it used to be free-for-all.** Every add
+   * and every erase is asynchronous — `addAnnotation` resolves a CFI before it
+   * paints — and they were launched with `void` while `#foreignDrawn` was
+   * updated as though they had already happened. Two interleavings follow, and
+   * both leave the page saying the opposite of the truth:
+   *
+   *  - an add is still in flight when the passage is withdrawn; the erase runs,
+   *    finds nothing to remove, and is forgotten; the old add then lands and
+   *    paints a withdrawn passage that nothing is tracking any more, so no
+   *    later redraw will take it off;
+   *  - a passage is dropped and restored within one turn; the new add lands
+   *    first and the stale erase lands last, removing the mark that should be
+   *    there.
+   *
+   * Serialising per section removes the whole class rather than the two
+   * instances: while a pass is running, another request only marks the section
+   * dirty, and the pass runs again from the CURRENT answer when it finishes.
+   * The desired state is re-read at the top of every pass, so a request that
+   * arrived mid-flight is never lost and never applied out of order.
+   */
+  async #reconcileForeign(view: View, index: number): Promise<void> {
+    if (this.#reconciling.has(index)) {
+      /* A pass is running; it will re-read the answer when it lands. */
+      this.#reconciling.set(index, true)
+      return
+    }
+    this.#reconciling.set(index, false)
+    try {
+      do {
+        this.#reconciling.set(index, false)
+        if (this.#disposed || !this.#sections.has(index)) return
+        await this.#foreignPass(view, index)
+      } while (this.#reconciling.get(index) === true)
+    } finally {
+      this.#reconciling.delete(index)
+    }
+  }
+
+  /** One reconciliation, from the answer as it stands right now. */
+  async #foreignPass(view: View, index: number): Promise<void> {
+    const now = new Map<string, ForeignAnchor>()
+    for (const anchor of this.#cb.getOverlays?.() ?? []) {
+      if (anchor.sectionIndex !== index) continue
+      now.set(anchor.key, anchor)
+    }
+    /* ⚠️ **ERASED BEFORE THE REST ARE DRAWN — see `#foreignDrawn`.** Anything
+     * this section held and the current answer no longer names has been
+     * withdrawn, and nothing else will ever ask for it to come off. */
+    const held = new Map(now)
+    for (const [key, anchor] of this.#foreignDrawn.get(index) ?? []) {
+      if (now.has(key)) continue
+      /* ⚠️ **KEPT UNTIL THE ERASE IS SEEN TO WORK, and it used to be dropped
+       * on the attempt.** `attachForeign` swallows its failures by design —
+       * the CFI of a PDF page that has not been painted does not resolve yet —
+       * so "asked to remove it" and "removed it" are different facts, and only
+       * one of them was recorded. Forgetting the anchor on the attempt meant a
+       * withdrawal that failed once was never retried: the friend's underline
+       * stayed on the page, and every later redraw agreed there was nothing to
+       * take off. */
+      if (await attachForeign(view, anchor, true)) continue
+      held.set(key, anchor)
+    }
+    /* Together, not one after another: within a pass a key is either being
+       erased or being drawn and never both, so two adds cannot conflict —
+       and a section with several friends' marks should not pay for them
+       one round trip at a time. */
+    await Promise.all([...now.values()].map((anchor) => attachForeign(view, anchor)))
+    /* Written AFTER both halves have settled, so the record is what is on the
+       page rather than what was asked for. */
+    if (this.#disposed) return
+    if (held.size === 0) this.#foreignDrawn.delete(index)
+    else this.#foreignDrawn.set(index, held)
+  }
+
+
+  /**
+   * Which spine item this relocation is in.
+   *
+   * THREE SOURCES, BEST FIRST, and the order is the point.
+   *
+   * `detail.section.current` is the renderer's OWN index — the same number
+   * `load` carries — and it is simply correct. It was not used at first
+   * because `vite-env.d.ts` did not declare it; see that file for the
+   * measurement, and for the fixed-layout spread this fixes.
+   *
+   * The range's own document is the fallback for a renderer that publishes no
+   * section. `#indexOf` is keyed by document and populated on `load`, so it is
+   * the same number the selection path stamps onto a mark, and it is exact at
+   * a section boundary in scrolled flow where two documents are on screen.
+   *
+   * The last-rendered section is the last resort, and it is the one that can
+   * be wrong: a fixed-layout spread loads its left page and then its right,
+   * and can afterwards show either without loading again. Reached only when a
+   * renderer gives neither of the other two.
+   *
+   * Null when none of the three can answer, which is before the first section
+   * has loaded — and null rather than 0, because 0 is a real section.
+   */
+  #sectionOf(detail: Pick<RelocateDetail, 'section' | 'range'>): {
+    index: number | null
+    exact: boolean
+  } {
+    const published = detail.section?.current
+    if (typeof published === 'number' && Number.isInteger(published) && published >= 0) {
+      return { index: published, exact: true }
+    }
+    /*
+     * THE LAST-RENDERED SECTION, AND WHETHER IT CAN BE TRUSTED.
+     *
+     * It is the last resort and the only one that can be wrong — but not always
+     * wrong, and the difference decides whether a whole class of book can be
+     * bookmarked at all. The case it gets wrong is a SPREAD: two pages shown
+     * side by side, loaded one after the other, and afterwards either can be
+     * the one the reader means without anything loading again. One page shown,
+     * and "the section that rendered last" is the section on screen.
+     *
+     * ASKED OF WHAT IS DISPLAYED, not of what is loaded, and that distinction
+     * is the whole of this. Counting live documents was the first attempt and
+     * it is a proxy for the wrong thing: a renderer is free to hold a spread's
+     * partner page in memory while showing one — prefetching, or keeping the
+     * page just turned away from — and every such book would have been refused
+     * a bookmark on the strength of a document nobody could see. That is a
+     * working feature taken away to fix an edge case, which is the worse trade
+     * by far. `spread` is the renderer's own answer to "am I showing two".
+     *
+     * AND AN UNKNOWN RENDERER IS TRUSTED, deliberately. A renderer that does
+     * not publish the attribute leaves this exactly where it was before any of
+     * this existed — no worse than today for anything already working, and the
+     * defect is caught wherever the renderer will say. Refusing on silence
+     * would be guessing in the direction that breaks things.
+     *
+     * Labelled rather than dropped, because the two callers want different
+     * things from it. The position readout wants "roughly where", where the
+     * neighbouring page beats nothing. `placeHere` records a durable, syncable
+     * anchor, and a bookmark naming the wrong page of a spread is a row that
+     * takes the reader somewhere they never were — indistinguishable,
+     * afterwards, from a good one.
+     */
+    const guess = {
+      index: this.#renderedIndex,
+      /* Nothing rendered is nothing to be exact ABOUT — without this the
+         position published before the first section loads carried a null
+         index beside a confident `true`, which is two fields disagreeing. */
+      exact: this.#renderedIndex !== null && !this.#showingTwoSections(),
+    }
+    const range = detail.range
+    if (!range) return guess
+    const node = range.startContainer
+    /* A Document's own `ownerDocument` is null — it does not have an owner, it
+     * IS one. A range anchored at the document node is not the ordinary case,
+     * but it costs one comparison to not read null out of it and fall through
+     * to a section the reader is not in. */
+    const doc = node.nodeType === DOCUMENT_NODE ? (node as Document) : node.ownerDocument
+    if (!doc) return guess
+    const known = this.#indexOf.get(doc)
+    /* Keyed by document and populated on `load`, so this is the same number the
+       selection path stamps onto a mark — exact even at a section boundary in
+       scrolled flow, where two documents are on screen at once. */
+    return known === undefined ? guess : { index: known, exact: true }
+  }
+
+  /**
+   * Where the reader is, as everything a bookmark needs to be made from — or
+   * null when this place cannot be pinned down.
+   *
+   * ON DEMAND, which is the reason it is a method rather than more fields on
+   * `ReaderPosition`. The cheap half of "where am I" — the CFI and the section
+   * — is published on every relocation because the ribbon and the toggle read
+   * it on every page turn. The expensive half is this: `rangeText` walks the
+   * page's text nodes and `markContext` walks its neighbours, and both are
+   * paid once, when the reader actually asks for a bookmark.
+   *
+   * Null rather than a degraded answer for a place with no CFI or no section:
+   * a bookmark whose anchor cannot be resolved is a row in a list that goes
+   * nowhere, and it would be indistinguishable from one whose book has simply
+   * changed underneath it.
+   *
+   * TAKES NO ARGUMENT, and it used to take the CFI. The reasoning for passing
+   * one in was that the host already holds the current CFI, so reading a
+   * second copy here would be a second answer to a question that already has
+   * one — and that was exactly backwards. The host's copy and this session's
+   * range are updated on different schedules, so between a relocation and
+   * React committing it they describe different pages; pairing them produced a
+   * bookmark carrying the previous page's anchor with this page's section and
+   * text. There is one answer, it is `#relocated`, and it is taken whole.
+   *
+   * The TEXT is allowed to be empty and the place still stands. A fixed-layout
+   * book reports no range, so there is nothing to read a line out of — and a
+   * PDF page is exactly the kind of place a reader wants to bookmark. The list
+   * falls back to the chapter for those.
+   */
+  placeHere(): BookmarkPlace | null {
+    const at = this.#relocated
+    /* AND NOT ON A GUESSED SECTION — see `#sectionOf`. A bookmark is a durable
+       record that syncs; one carrying the wrong page of a spread is a row that
+       takes the reader somewhere they never were, and nothing downstream can
+       tell it from a good one. Refusing is visible: the toggle goes quiet. */
+    if (!at || !at.cfi || at.sectionIndex === null || !at.sectionExact) return null
+    /* A range whose ends have left the document describes a page that has been
+     * re-rendered since — the same check `publish` makes on a selection, for
+     * the same reason. The place is still good; only its remembered text is
+     * not, so the text is dropped rather than the bookmark. */
+    const range = at.range && connectedRange(at.range) ? at.range : null
+    const context = range ? markContext(range) : { prefix: '', suffix: '' }
+    return {
+      cfi: at.cfi,
+      sectionIndex: at.sectionIndex,
+      chapter: at.chapter,
+      text: range ? rangeText(range) : '',
+      prefix: context.prefix,
+      suffix: context.suffix,
+    }
+  }
+
+  /**
+   * Walk this book for the marks that have no anchor here — WI-22.A2.
+   *
+   * The session's half of the pass: it supplies the SECTIONS and the liveness,
+   * `reanchorPass` decides the walk, and the host does the writing.
+   *
+   * ⚠️ **`section.createDocument()`, NOT a second parse of the file.** That
+   * object is the one `refuseBookScripts` wrapped at open, so the strip applies
+   * to it too — which is what makes a path derived from it address the same
+   * text the reader sees. A host that opened the file again to do this would
+   * get an unstripped document and a path that can disagree by a child index.
+   *
+   * ⚠️ **`#disposed` IS THE LIVENESS, and it has to be read at the moment the
+   * walk asks rather than captured.** A closure over `this.#view` would keep a
+   * whole book alive for the length of a walk the reader ended by closing it.
+   */
+  async reanchorUnplaced(pending: readonly PendingMark[]): Promise<PassOutcome> {
+    const view = this.#view
+    const sections = view?.book?.sections
+    if (this.#disposed || !Array.isArray(sections)) {
+      /* NOT `complete: true`. Nothing was looked at, so nothing has been
+       * established — and a caller that remembered these as misses would
+       * answer "not in these bytes" for a book it never opened. */
+      return { found: [], missed: [], complete: false, walked: 0 }
+    }
+    return reanchorPass(pending, {
+      sections: sections.length,
+      documentFor: async (index) => {
+        const section = sections[index] as
+          | { createDocument?: () => Promise<Document> }
+          | null
+          | undefined
+        if (!section || typeof section.createDocument !== 'function') return null
+        const doc = await section.createDocument()
+        return doc.body ?? doc
+      },
+      live: () => !this.#disposed && this.#view === view,
+      breathe: BREATHE,
+    })
+  }
+
+  /**
+   * Report the book's selection to the host.
+   *
+   * Split across three triggers on purpose. `selectionchange` fires
+   * continuously while a drag is in progress, so publishing a snapshot from it
+   * would make the popup chase the pointer; it is used only to CLEAR, which is
+   * what makes a click-to-dismiss feel immediate and is why that path is never
+   * deferred. The snapshot itself is published when the gesture ends — and the
+   * two gestures end differently:
+   *
+   * - **pointerup** hands the selection to the deferred snap, and the snapshot
+   *   is published when that settles. A drag is what word snapping is for, and
+   *   the deferral is WI-8's: writing a wider selection while foliate's
+   *   paginator still has its pointer flag up turns the page
+   *   (`paginator.js:586`). It publishes whether or not the snap wrote
+   *   anything: provenance decides whether the selection is WIDENED, never
+   *   whether it is reported, and a pointer gesture that published nothing
+   *   would leave the reader with no toolbar to mark or copy from. Only a
+   *   CANCELLED snap publishes nothing — a section torn down or a PDF page
+   *   repainted, where there is no longer a gesture to report.
+   * - **keyup** publishes immediately and unsnapped. Shift+arrow is
+   *   character-granular, and taking that away is the one thing the keyboard
+   *   selection has over the mouse's.
+   */
+  #watchSelection(doc: Document, view: View, index: number): void {
+    const selectionOf = (): Range | null => {
+      const selection = doc.defaultView?.getSelection()
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null
+      return selection.getRangeAt(0)
+    }
+
+    /** Whether THIS document's snapshot is the one on screen, so a repaint
+     *  knows whether it has a popup to take down. Asked of `#selectionOwner`
+     *  rather than kept per document — see that field — and not asked of the
+     *  host, because publishing `null` on every repaint would churn the popup
+     *  state continuously through a pinch. */
+    const owns = () => this.#selectionOwner === doc
+
+    /**
+     * Publish one range — always one the caller has just read, never one
+     * captured before a mutation.
+     *
+     * That is the whole reason this takes an argument. `setBaseAndExtent`
+     * DETACHES a previously issued `Range` (measured in WebKit): the captured
+     * one keeps returning the old text while the live selection returns the
+     * snapped text, so a `publish` that read its range once and used it either
+     * side of the snap would store a cfi and a text describing a selection the
+     * reader never made. `applySnap` returns the range it read AFTER the write
+     * for exactly this call.
+     *
+     * The text is not `range.toString()` either — see `rangeText`, which spells
+     * block boundaries and drops the invisible characters that must not reach
+     * stored mark text.
+     */
+    const publish = (range: Range | null) => {
+      if (this.#disposed) return
+      /* A range whose ends have LEFT the document describes a page that no
+       * longer exists. On a PDF that is what a zoom does — `makePdf`'s `paint`
+       * calls `replaceChildren()` on the text layer — and WI-8's deferral means
+       * a snap can settle just after it, holding a range over nodes nobody can
+       * see. Publishing it would put the popup over a re-laid-out page pointing
+       * at nothing, which is worse than publishing nothing. */
+      const live = range && connectedRange(range) ? range : null
+      const text = live ? rangeText(live) : ''
+      if (!live || !text) {
+        /* Ownership goes with the popup: once null is published there is
+         * nothing on screen for anyone to own. The guard against one page of a
+         * spread taking down the other page's newer selection belongs at the
+         * REPAINT site, which asks `owns()` before calling here at all — not in
+         * this function, which must keep emitting null for every caller that
+         * reaches it or a collapsed selection stops dismissing the popup. */
+        this.#selectionOwner = null
+        this.#cb.onSelection(null)
+        return
+      }
+      this.#selectionOwner = doc
+      const context = markContext(live)
+      this.#cb.onSelection({
+        cfi: view.getCFI(index, live),
+        sectionIndex: index,
+        text,
+        prefix: context.prefix,
+        suffix: context.suffix,
+        range: live,
+      })
+    }
+
+    const publishLive = () => publish(selectionOf())
+
+    const clearIfCollapsed = () => {
+      if (this.#disposed) return
+      // Through `publish`, so the "is a popup up?" flag comes down with it. A
+      // clear that went straight to the callback would leave the flag saying
+      // `true`, and the next repaint would clear an already-cleared popup.
+      if (!selectionOf()) publish(null)
+    }
+
+    /**
+     * Where the selection came from, kept per document alongside the
+     * publishers.
+     *
+     * The snap reads it when it runs — never when it is scheduled — so a
+     * selection replaced between the gesture and the macrotask is not snapped,
+     * and a shift+arrow selection followed by a context-click is not either.
+     * Both are bound here rather than beside the snap so that every listener in
+     * this section lives and dies through the one teardown path — see
+     * `#onTeardown`, which is also where the pending snap is cancelled.
+     *
+     * Its `pointerup` listener is a second one on this document, and on a PDF
+     * page `bindSelectionFix` adds a third (`makePdf.ts:82`). None of the three
+     * may depend on running first, and none does: this one only lowers a flag,
+     * and scheduling a macrotask cannot be observed by either of the others.
+     */
+    const provenance = watchGestureProvenance(doc)
+    const snap = deferSnap(doc, {
+      isPointerProduced: provenance.isPointerProduced,
+      onSettled: (application) => publish(application.range),
+    })
+
+    /**
+     * A PDF page repainting underneath all of this.
+     *
+     * `makePdf`'s `paint` takes a render generation at the top of every zoom or
+     * re-render and finishes by calling `replaceChildren()` on the `.textLayer`
+     * — so both the pending snap and the published snapshot are about to be
+     * describing nodes that have left the document. Neither is recoverable, and
+     * a selection that is silently re-anchored to whatever now sits at those
+     * offsets is the outcome this exists to prevent: the snap is dropped, and
+     * the popup comes down.
+     *
+     * Not a `MutationObserver`: the generation already exists, is already what
+     * `paint` consults, and — unlike an observer — is reachable from the only
+     * test lane this repository has. The notification fires when the repaint
+     * STARTS, which is a moment before the nodes go, so this may not decide
+     * anything by asking whether they are still attached; at that moment they
+     * always are.
+     *
+     * An EPUB section never repaints this way, so its guard is never bumped and
+     * none of this ever runs for one.
+     */
+    const offReflow = createReflowGuard(doc).onReflow(() => {
+      snap.cancel()
+      if (owns()) publish(null)
+    })
+
+    doc.addEventListener('pointerup', snap.schedule)
+    doc.addEventListener('keyup', publishLive)
+    doc.addEventListener('selectionchange', clearIfCollapsed)
+
+    /* Selecting a range in THIS section, for the one caller that has a range
+     * but no document — see `show-annotation`. It goes through `publishLive`
+     * rather than through `publish(range)` directly, so what is published is
+     * whatever the selection actually became: `setBaseAndExtent` detaches the
+     * range it is handed, and publishing the detached one is the exact defect
+     * `publish`'s argument exists to prevent. */
+    this.#selectors.set(index, (range: Range) => {
+      /* Through `defaultView`, exactly as `selectionOf` above reaches it — a
+         document's selection belongs to its window, and the two must ask the
+         same object or one of them is reading a selection the other cannot
+         see. */
+      const selection = doc.defaultView?.getSelection()
+      if (!selection) return
+      selection.setBaseAndExtent(
+        range.startContainer,
+        range.startOffset,
+        range.endContainer,
+        range.endOffset,
+      )
+      publishLive()
+    })
+
+    this.#onTeardown(doc, () => {
+      provenance.unbind()
+      /* Not a DOM listener, so the listener-count assertions cannot see it: a
+       * section returned to twice would otherwise leave two watchers reacting
+       * to one repaint, each retaining this session and its document. */
+      offReflow()
+      /* Before the listeners come off, and covering both the section going away
+       * and the whole session being disposed: `dispose()` runs every teardown
+       * list it holds. A timer left armed here fires into a document nobody is
+       * reading and writes to its selection — the publish would be caught by
+       * the disposal latch, but the mutation would already have happened. */
+      snap.cancel()
+      doc.removeEventListener('pointerup', snap.schedule)
+      doc.removeEventListener('keyup', publishLive)
+      doc.removeEventListener('selectionchange', clearIfCollapsed)
+      /* A Map, so it only ever grows unless something takes the row out — the
+       * same reasoning as `#sections`, and the same failure if it is forgotten:
+       * a selector retaining a document nobody is reading. */
+      this.#selectors.delete(index)
+    })
+  }
+
+  /**
+   * Forward the book's keystrokes to the host.
+   *
+   * The book is an iframe with its own document, and clicking a page to read it
+   * puts focus inside that document — where every subsequent keystroke stays.
+   * A listener on the host window never sees them, so the ENTIRE keyboard map
+   * stopped working the moment the reader touched the thing they were reading:
+   * not just ← and →, but ⌘K, ⌘\, ⌘1…5 and Esc.
+   *
+   * It shows up worst on a fixed-layout book, where the arrows are the only way
+   * to turn a page and scrolling cannot cover for them — a PDF simply stayed on
+   * page one.
+   *
+   * Re-dispatching rather than handling here keeps one keymap in the app. The
+   * session has no business knowing what any key means; it only makes sure the
+   * event reaches the place that does.
+   */
+  #watchKeys(doc: Document): void {
+    const onKey = (event: KeyboardEvent) => {
+      if (this.#disposed) return
+
+      /* Typing inside the book stays inside the book.
+       *
+       * The host's keymap guards on `event.target` being a field — and the
+       * forwarded event's target is the WINDOW, so that guard cannot see a
+       * field inside the iframe. An EPUB with a form in it, or any content the
+       * book itself makes editable, would have every arrow key turn the page
+       * out from under the cursor. The check has to happen here, where the real
+       * target is still available. */
+      const target = event.target as HTMLElement | null
+      if (
+        target?.isContentEditable ||
+        target?.tagName === 'INPUT' ||
+        target?.tagName === 'TEXTAREA'
+      ) {
+        return
+      }
+
+      /* AND A KEY ON A CONTROL STAYS WITH THE CONTROL, for the same reason.
+       *
+       * The host guards its own reading keys against a focused control — Space
+       * on a toolbar button reached by Tab presses the button — and that guard
+       * could never fire for the book, because the forwarded copy's target is
+       * the window. So Space on a `<button>` or an arrow on a `<select>` inside
+       * an interactive EPUB was forwarded, the host turned the page, and the
+       * cancellation carried back below cancelled the control's own default
+       * too: the platform's meaning of the key, taken from under the reader's
+       * focus. Same outcome as typing — not forwarded, hence not cancelled. */
+      if (onBookControl(target)) return
+
+      const forwarded = new KeyboardEvent('keydown', {
+        key: event.key,
+        code: event.code,
+        metaKey: event.metaKey,
+        ctrlKey: event.ctrlKey,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        /* AND THE THREE THE HOST'S GUARDS READ. `repeat` was not copied, so a
+         * key held inside the book arrived at the keymap as a fresh press
+         * every auto-repeat: the toggle guard in `accel.ts` — whose own note
+         * says a held ⌘B writes a row and a tombstone per cycle — could not
+         * fire, because focus is in the book whenever the reader has clicked
+         * the page, which is most of the time. `location` tells a keypad
+         * Enter from the other one; `isComposing` is an IME mid-word. */
+        repeat: event.repeat,
+        location: event.location,
+        isComposing: event.isComposing,
+        bubbles: true,
+        cancelable: true,
+      })
+      window.dispatchEvent(forwarded)
+
+      /* Carry the cancellation back across the boundary.
+       *
+       * `preventDefault` on the copy does nothing to the original, so a key the
+       * host handled ALSO kept its default inside the book: PageDown turned the
+       * page and scrolled the document it had just left, and Space did both at
+       * once. The two documents have to agree about whether the key was
+       * consumed, and this is the only place that knows. */
+      if (forwarded.defaultPrevented) event.preventDefault()
+    }
+    doc.addEventListener('keydown', onKey)
+    this.#onTeardown(doc, () => doc.removeEventListener('keydown', onKey))
+  }
+
+  /**
+   * Does the platform have a real scroll to perform with this event?
+   *
+   * Asked of the renderer, not of the app: what a gesture MEANS is the host's
+   * question and is answered in `Reader`, but whether the event has a default
+   * worth suppressing is a fact about the renderer. It has to be settled here,
+   * because `preventDefault` counts only synchronously inside the listener.
+   *
+   * THE TWO RENDERERS ANSWER IT DIFFERENTLY, and asking only `flow` was the
+   * regression that killed swiping on PDFs. A fixed-layout book is drawn by
+   * `foliate-fxl`, whose `observedAttributes` is `['zoom']` — `flow` sits on it
+   * unread, so reading it back meant a reader who had ever chosen scrolled mode
+   * got a PDF that ignored every gesture, in a renderer that could not scroll
+   * either way.
+   *
+   *   paginator, `flow="scrolled"`  — its scrollport is inside a CLOSED shadow
+   *     root, so the host cannot even see it. Hands the event straight back.
+   *
+   *   fxl, `zoom="fit-width"`       — the scrollport IS the renderer element
+   *     (`:host { overflow: auto }`), so its position is readable from here and
+   *     the answer can be exact: hand the event back while the page has further
+   *     to go, and take it at the edge so the gesture turns the page instead.
+   *     That edge check is what makes a PDF read continuously — reaching the
+   *     bottom of one page carries on to the next, rather than stranding the
+   *     reader on page one with a dead trackpad.
+   */
+  /**
+   * Land on the foot of a page the reader reached by scrolling up into it.
+   *
+   * Deferred by a frame, and that is the whole difficulty. The `load` event
+   * fires when the page's document is ready, which is BEFORE `foliate-fxl` has
+   * scaled the frame — so `scrollHeight` at this instant is the pre-layout
+   * value and scrolling to it lands somewhere arbitrarily short. A frame later
+   * the layout is settled.
+   *
+   * A SUSPENDED FRAME RESUMES, which is the part that has to be defended
+   * against and which an earlier comment here got wrong. An occluded window
+   * stops servicing `requestAnimationFrame` — this project has been caught by
+   * that before — but it does not cancel the callback: it runs when the window
+   * comes back, which may be minutes and several pages later. So the deadline is
+   * re-checked INSIDE the frame rather than only before scheduling it, and the
+   * renderer is the one captured when the page loaded rather than whichever is
+   * current when the frame finally arrives. Without both, coming back to an
+   * occluded reader scrolled whatever page happened to be open.
+   */
+  #openAtFootIfArrivedBackwards(): void {
+    const armed = this.#enterAtFootAt
+    this.#enterAtFootAt = null
+    if (armed === null || performance.now() - armed > ENTER_AT_FOOT_MS) return
+    /* Captured here, at the load this belongs to. Reading it inside the callback
+     * would resolve a renderer that may by then belong to a different book. */
+    const renderer = this.#view?.renderer
+    if (!renderer) return
+    const toFoot = () => {
+      if (this.#disposed) return
+      if (performance.now() - armed > ENTER_AT_FOOT_MS) return
+      if (this.#view?.renderer !== renderer || !this.#scrollsByPage()) return
+      /* Assigning past the end is how the DOM is asked for "the bottom" — it
+       * clamps to the maximum, so this needs no arithmetic and cannot overshoot
+       * if the layout settled at a different height than expected. */
+      renderer.scrollTop = renderer.scrollHeight
+    }
+    /* Read off `globalThis` rather than called bare, because a bare call throws
+     * where the function does not exist — which would take down section loading
+     * entirely, for a scroll-position nicety. The immediate path is a real
+     * fallback rather than a test affordance: it lands correctly whenever the
+     * layout is already settled, and simply lands short when it is not. */
+    const raf = globalThis.requestAnimationFrame
+    if (typeof raf === 'function') raf(toFoot)
+    else toFoot()
+  }
+
+  /**
+   * A fixed-layout book scaled to the width — one page per section, scrolled.
+   *
+   * The shape a PDF takes in scroll mode. Named rather than inlined because two
+   * separate decisions turn on it: whether a wheel event is the platform's, and
+   * whether arriving at a new page backwards should open its foot.
+   */
+  /**
+   * Whether more than one SECTION is on screen at once.
+   *
+   * The question `#sectionOf`'s last resort turns on, and there are exactly two
+   * ways for the answer to be yes — one per renderer:
+   *
+   *   - **A fixed-layout spread.** Two pages side by side, and `spread` is the
+   *     pre-paginated renderer's own word for it. Asked of the attribute rather
+   *     than of how many documents are loaded, because a renderer is free to
+   *     hold a spread's partner in memory while showing one page; counting
+   *     loads would refuse a bookmark on the strength of a page nobody can see,
+   *     which takes a working feature away to fix an edge case.
+   *
+   *   - **Scrolled flow at a section boundary**, where a reflowable book has
+   *     the end of one section and the start of the next both visible. Here
+   *     the count IS the signal: a paginated renderer shows one section at a
+   *     time, and a scrolled one holds live only what it is showing.
+   *
+   * A renderer that answers neither leaves this exactly where it was before
+   * any of it existed. Silence must not cost a working bookmark.
+   */
+  #showingTwoSections(): boolean {
+    const view = this.#view
+    if (!view) return false
+    if (view.isFixedLayout) {
+      // `'none'` is the attribute's own word for a single page.
+      const spread = view.renderer?.getAttribute('spread')
+      return spread !== null && spread !== undefined && spread !== 'none'
+    }
+    return view.renderer?.getAttribute('flow') === 'scrolled' && this.#rendered.size > 1
+  }
+
+  #scrollsByPage(): boolean {
+    const view = this.#view
+    return view?.isFixedLayout === true && view.renderer?.getAttribute('zoom') === 'fit-width'
+  }
+
+  #platformScrolls(event: WheelEvent): boolean {
+    const view = this.#view
+    const renderer = view?.renderer
+    if (!view || !renderer) return false
+
+    /* THE AUTHOR'S OWN SCROLLING BOXES COME FIRST, before anything about flow.
+     *
+     * A book is HTML, and a book designer may put a long code listing or a wide
+     * table in an `overflow: auto` box. In paged flow the whole event was being
+     * consumed, so a wheel over that box turned the page instead of scrolling
+     * it, and its content below the fold was simply unreachable. Nothing about
+     * the reader's flow setting makes that right.
+     *
+     * Walked from the event's target rather than asked of the renderer, because
+     * this is a question about what is UNDER THE POINTER. It stops at the body:
+     * beyond that is the document scroller, which in paged flow is the
+     * paginator's business and is exactly what the suppression exists for. */
+    if (scrollableUnder(event)) return true
+
+    if (!view.isFixedLayout) return renderer.getAttribute('flow') === 'scrolled'
+    if (!this.#scrollsByPage()) return false
+
+    /* Only a dominantly VERTICAL gesture is a scroll. A horizontal swipe means
+     * the page left or right whatever the reader has scrolled to, and letting
+     * it fall in here would silently do nothing whenever the page happened to
+     * be scrolled away from an edge. */
+    if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return false
+
+    /* The one-pixel slack absorbs fractional layout: a scrollport sized by a
+     * scaled canvas lands on `scrollHeight` a hair over `clientHeight` with
+     * nothing actually to scroll, and an exact comparison would then hand back
+     * every event and wedge the book on that page. */
+    const remaining = renderer.scrollHeight - renderer.clientHeight
+    if (remaining <= 1) return false
+    return event.deltaY > 0 ? renderer.scrollTop < remaining - 1 : renderer.scrollTop > 1
+  }
+
+  /**
+   * Turn a trackpad swipe into one page.
+   *
+   * The detector is per SESSION, not per document: a gesture that begins on one
+   * spine item and finishes after the next has loaded is one gesture, and a
+   * fresh detector per document would lose its accumulated travel halfway
+   * through. Nothing resets it explicitly — it is discarded WITH the session,
+   * and a session is never reused for a second book.
+   *
+   * NOT passive, and the earlier comment here had it exactly backwards. It said
+   * there was no default to suppress because paged flow has nothing to scroll.
+   * There is: a wheel event that reaches a scroll container with nowhere to go
+   * chains outwards until something bounces, and on macOS that is the viewport
+   * — so every swipe dragged the whole application sideways and sprang back.
+   * Reported as the window "shaking".
+   *
+   * So in PAGED flow the gesture is consumed. `global.css` also terminates the
+   * chain at the document, which covers everything that never reaches here;
+   * this covers the case properly, by saying the event was handled.
+   *
+   * In SCROLLED flow it is not touched. The book genuinely scrolls there, and
+   * consuming the event would stop it dead.
+   */
+  #watchWheel(doc: Document): void {
+    const onWheel = (event: WheelEvent) => {
+      if (this.#disposed) return
+      /* Only real input. A book is attacker-controlled HTML in a same-origin
+       * frame, and `dispatchEvent(new WheelEvent('wheel', { deltaY: 40 }))`
+       * would otherwise let its script drive the host's navigation and clear
+       * the reader's selection at will. Phase 0's policy stops book script
+       * running at all; this is the second lock on the same door, and it is the
+       * same property the gesture checklist relies on to say the MCP bridge
+       * cannot fake a gesture. */
+      if (!event.isTrusted) return
+
+      /* A PINCH, which arrives as a wheel event with `ctrlKey` set, and which
+       * has to be let go BEFORE the suppression below rather than after.
+       *
+       * `wheelPager` already declines to page on one, so the gesture was
+       * harmless — but declining happens after `preventDefault`, and by then the
+       * platform's zoom and the paginator's own pinch handling have both been
+       * cancelled. A reader pinching a PDF page got nothing at all, which looks
+       * exactly like a missing feature rather than a suppressed one. */
+      if (event.ctrlKey) return
+
+      if (this.#platformScrolls(event)) return
+      event.preventDefault()
+      /* The HOST's clock, not `event.timeStamp`.
+       *
+       * A DOM event's timestamp is relative to its own global's time origin,
+       * and every spine item is a separate iframe with a separate origin. The
+       * pager is per-session on purpose — a gesture can span a section boundary
+       * — so mixing the two scales compares numbers that are not on the same
+       * axis. Turning a page at a boundary loads a new document, the momentum
+       * tail lands in THAT document, and its timestamps start near zero while
+       * the previous document's were large: the gap goes hugely negative, never
+       * exceeds the quiet period, and the gesture never ends. */
+      const intent = this.#pager.feed(event, performance.now())
+      if (!intent) return
+      /* Only a backwards VERTICAL intent, and only where scrolling is how the
+       * book is read. A sideways swipe is a page turn, and a page turn lands at
+       * the top like every other one. */
+      this.#enterAtFootAt =
+      intent === 'prev' && this.#scrollsByPage() ? performance.now() : null
+      this.#cb.onPageIntent(intent)
+    }
+    doc.addEventListener('wheel', onWheel, { passive: false })
+    this.#onTeardown(doc, () => doc.removeEventListener('wheel', onWheel))
+  }
+
+  /**
+   * Intercept a book dropped onto the book.
+   *
+   * Without this the webview NAVIGATES to the dropped file and the whole
+   * application is replaced by WebKit's PDF viewer — an <embed> at a file://
+   * URL, no titlebar, no pane, no reader, no error, no way back. The host
+   * already prevents that at the window, but a drop over an iframe is
+   * delivered to THAT document and never reaches the window at all. So the
+   * first drop onto an empty reader worked and the second, onto the open book,
+   * did not.
+   *
+   * `dragover` is the load-bearing prevention: without it there is no drop
+   * event and the navigation happens regardless of what the drop handler says.
+   *
+   * The file is handed over directly rather than re-dispatched. A DragEvent
+   * cannot carry its dataTransfer across a synthetic re-dispatch, and the
+   * documents are same-origin, so passing the File itself is both simpler and
+   * the only thing that actually works.
+   */
+  #watchDrops(doc: Document): void {
+    const allow = (event: DragEvent) => {
+      if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return
+      event.preventDefault()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+    }
+    const onDrop = (event: DragEvent) => {
+      // Unconditional: a dropped URL navigates away just as a file does.
+      event.preventDefault()
+      if (this.#disposed) return
+      const file = event.dataTransfer?.files?.item(0)
+      if (file) this.#cb.onFileDropped(file)
+    }
+
+    doc.addEventListener('dragenter', allow)
+    doc.addEventListener('dragover', allow)
+    doc.addEventListener('drop', onDrop)
+    this.#onTeardown(doc, () => {
+      doc.removeEventListener('dragenter', allow)
+      doc.removeEventListener('dragover', allow)
+      doc.removeEventListener('drop', onDrop)
+    })
+  }
+
+  /**
+   * Register teardown for one document, replacing any it already had.
+   *
+   * foliate re-loads a section every time the reader returns to it, and each
+   * load re-runs the watchers. Without replacing, the same document
+   * accumulates duplicate listeners — every keystroke forwarded twice, every
+   * page turn advancing two spreads — and every superseded closure keeps its
+   * document alive.
+   *
+   * `pagehide` releases the entry as the document goes away, so a book read
+   * end to end does not carry every section it passed through.
+   *
+   * That `pagehide` listener is itself torn down, and it is the FIRST entry in
+   * the list so that every path which releases a document releases it too. It
+   * used to be the one listener nothing removed: a section reload runs
+   * `#resetWatchers`, which drops the map entry, and the next `#onTeardown`
+   * then registered a second `pagehide` on the same window — one more per
+   * return to a section, each retaining this session and its document, while
+   * every other listener in the file was scrupulously balanced.
+   */
+  #onTeardown(doc: Document, off: () => void): void {
+    const existing = this.#unwatch.get(doc)
+    if (existing) {
+      this.#unwatch.set(doc, [...existing, off])
+      return
+    }
+    const view = doc.defaultView
+    const onPageHide = () => {
+      for (const fn of this.#unwatch.get(doc) ?? []) fn()
+      this.#unwatch.delete(doc)
+    }
+    this.#unwatch.set(doc, [() => view?.removeEventListener('pagehide', onPageHide), off])
+    view?.addEventListener('pagehide', onPageHide, { once: true })
+  }
+
+  /**
+   * Redraw this document's marks once its webfont has actually arrived.
+   *
+   * A mark's band is positioned against the font's metrics — see
+   * `balanceRects` — and a section renders before the face loads, so the first
+   * paint measures the fallback. Without a redraw the band keeps the
+   * fallback's geometry for as long as the section is on screen.
+   *
+   * BOTH signals, because neither alone is enough. `fonts.ready` can already
+   * be fulfilled at the moment this runs: it is read inside foliate's `load`
+   * callback, before the iframe has rendered anything, so the set may be idle
+   * and the promise resolves immediately — before the face the render is about
+   * to request has even been asked for. `loadingdone` fires when a later cycle
+   * finishes, which is the one that matters. Redrawing twice is harmless;
+   * `addAnnotation` replaces rather than stacks.
+   */
+  #redrawWhenFontsLand(doc: Document): void {
+    const fonts = doc.fonts
+    if (!fonts) return
+
+    const redraw = () => {
+      /* This document's own section, not every live one. The liveness check
+       * alone was not enough: a font settling in any still-mounted section
+       * redrew all of them, which for a book with marks in three rendered
+       * sections is three times the CFI resolution for one font event. */
+      if (this.#disposed || !this.#unwatch.has(doc)) return
+      const view = this.#view
+      const index = this.#indexOf.get(doc)
+      if (!view || index === undefined || !this.#sections.has(index)) return
+      this.#drawSection(view, index)
+    }
+
+    fonts.addEventListener('loadingdone', redraw)
+    this.#onTeardown(doc, () => fonts.removeEventListener('loadingdone', redraw))
+
+    /* `FontFaceSet.ready` does not reject — a document torn down mid-load
+     * simply never settles it. But `.then(redraw)` is a NEW promise, and it
+     * rejects if `redraw` throws, which this used to leave unhandled at the
+     * window. Reported, not swallowed: the point of the original "no catch"
+     * note was that a failure in `redrawMarks` must not disappear, and a catch
+     * that logs keeps that while giving the rejection somewhere to go. */
+    void fonts.ready
+      .then(redraw)
+      .catch((cause: unknown) => console.error('Carta: redraw after fonts loaded failed', cause))
+  }
+
+  /** Drop the listeners a document had, before re-registering them. */
+  #resetWatchers(doc: Document): void {
+    for (const off of this.#unwatch.get(doc) ?? []) off()
+    this.#unwatch.delete(doc)
+  }
+
+  /**
+   * Idempotent, and safe at any point in startup.
+   *
+   * Every step is isolated, and the resource-releasing half runs in a `finally`.
+   * `#disposed` latches on entry, so a single throwing host callback or teardown
+   * function used to abort the rest of this method permanently: the next call
+   * returned at the guard, and the listeners, the prepared book, the view and
+   * the host were never released. The one thing teardown must not do is stop
+   * halfway, so nothing here is allowed to propagate.
+   */
+  dispose(): void {
+    if (this.#disposed) return
+    this.#disposed = true
+    try {
+      quietly('onDocument', () => this.#cb.onDocument(null))
+      quietly('onNavigator', () => this.#cb.onNavigator(null))
+      quietly('onSelection', () => this.#cb.onSelection(null))
+      for (const offs of this.#unwatch.values())
+        for (const off of offs) quietly('teardown', off)
+    } finally {
+      this.#unwatch.clear()
+      this.#sections.clear()
+      this.#rendered.clear()
+      this.#foreignDrawn.clear()
+      this.#reconciling.clear()
+      this.#painters = null
+      /**
+       * ⚠️ **THE OPEN NOTE USED TO SURVIVE THE BOOK.**
+       *
+       * A footnote is rendered into its own `View` — a second foliate view with
+       * its own iframe, renderer and listeners — and it is mounted OUTSIDE
+       * `#host` whenever `setFootnoteMount` has been given somewhere to put it,
+       * which is how the reader draws notes in the gloss strip. So
+       * `#host.replaceChildren()` below did not remove it: closing a book with
+       * a note open left that note on screen, over the next book, with a live
+       * iframe and a renderer behind it. One per book opened.
+       *
+       * BEFORE the host is cleared, and independently of it — the release must
+       * not depend on where the note happened to be mounted, which is the
+       * assumption that made this invisible.
+       */
+      quietly('footnote view', () => this.#releaseFootnoteView())
+      this.#noteSeq += 1
+      /* AND THE HOST IS TOLD. `#disposed` is already true, so `closeFootnote`
+         would skip this — and a host left holding a `FootnoteRender` for a
+         session that is gone draws a note nothing can close. */
+      quietly('onFootnote', () => this.#cb.onFootnote(null))
+      const prepared = this.#prepared
+      this.#prepared = null
+      if (prepared) destroyQuietly(prepared)
+      const built = this.#view
+      this.#view = null
+      if (built) {
+        closeQuietly(built)
+        /**
+         * ⚠️ **`View.close()` CLOSES THE RENDERER AND NEVER THE BOOK.** The
+         * fork's `close` destroys and removes the renderer and nulls its own
+         * progress state; the `Book` — the backend's parse — is not its to
+         * release, and until now nothing else released it either. A
+         * fixed-layout EPUB keeps every visited section's blob URLs in
+         * `Loader.#cache`; CBZ holds two object URLs per page; FB2 mints one
+         * per section at parse; MOBI holds `#resourceCache`. The enrichment
+         * pass found and fixed this for ITS parse (`parseBook.ts`); the
+         * reader's own path was missed — one book's resources per book opened.
+         *
+         * AFTER the note view and after the close, because the note view
+         * SHARES the book (which is why `releaseNoteView` correctly leaves it
+         * alone) and a book destroyed under a renderer still tearing down is a
+         * renderer reading revoked URLs. And NOT AGAIN for a PDF: there the
+         * book IS `#prepared`, destroyed just above, and `makePdf`'s teardown
+         * releases a worker that is not there to release twice.
+         */
+        const book: unknown = built.book
+        if (book !== prepared && destroyable(book)) destroyQuietly(book)
+      }
+      quietly('host cleanup', () => this.#host.replaceChildren())
+    }
+  }
+}
+
+/**
+ * The first spine item a reader can turn to, or -1 for a spine with none.
+ *
+ * `linear === 'no'` marks an item the reading order skips — a cover page's
+ * standalone image, an in-book popup — and the paginator's own `#adjacentIndex`
+ * skips them by exactly this test. The by-index fallback in `#display` lands
+ * where a page turn would.
+ */
+function firstLinearSection(book: { readonly sections?: readonly unknown[] }): number {
+  return (book.sections ?? []).findIndex((section) => (section as { linear?: unknown } | null)?.linear !== 'no')
+}
+
+/**
+ * The controls whose keys are their own — see `#watchKeys`.
+ *
+ * The host's guard (`App.tsx`) also lists `a[href]`, and this one deliberately
+ * does not. Chromium focuses a clicked link and foliate's click handler cancels
+ * the CLICK, not the focus — so on the browser client a footnote the reader had
+ * just tapped would leave its `<a>` focused, and → to read on would be swallowed
+ * until they clicked the prose. Space and the arrows are not a link's own keys
+ * in any case: Enter is, and Enter turns no page.
+ */
+const IN_BOOK_CONTROL = 'button, select, summary, [role="menu"], [role="listbox"], [role="dialog"]'
+
+function onBookControl(target: HTMLElement | null): boolean {
+  return typeof target?.closest === 'function' && target.closest(IN_BOOK_CONTROL) !== null
+}
+
+/**
+ * Release a prepared book, reporting a failure rather than hiding it.
+ *
+ * Best effort because a half-open document must not stop the rest of teardown —
+ * but loud, because what is being released here is a worker and a set of object
+ * URLs, and a silent failure to release them is a leak that grows one book at a
+ * time with nothing on screen to suggest it.
+ */
+function reportNavigation(what: string, target?: string): (cause: unknown) => void {
+  return (cause) => {
+    console.warn(`Carta: ${what}${target ? ` ${target}` : ''} failed`, cause)
+  }
+}
+
+function destroyQuietly(prepared: Destroyable): void {
+  try {
+    /* Not awaited: disposal is synchronous by contract and the session is
+       being torn down either way. The promise is there for the enrichment
+       pass, which parses serially and does need the worker gone — and a
+       REJECTING destroy is caught too, not only a throwing one: the `try`
+       cannot see a rejection, and an unhandled one at teardown was the last
+       thing a closing book said (audit round 1, #837). */
+    Promise.resolve(prepared.destroy()).catch((cause: unknown) => {
+      console.error('Carta: failed to destroy the prepared book', cause)
+    })
+  } catch (cause) {
+    console.error('Carta: failed to destroy the prepared book', cause)
+  }
+}
+
+/**
+ * Run one step of teardown without letting it stop the rest.
+ *
+ * `dispose()` latches `#disposed` on entry, so a step that throws used to make
+ * teardown unfinishable rather than merely incomplete — the next call returned
+ * at the guard and the remaining listeners, the book, the view and the host
+ * were never released. Reported rather than swallowed: a host callback that
+ * throws during teardown is a real defect, and the leak it used to cause was
+ * invisible precisely because nothing said anything.
+ */
+function quietly(what: string, step: () => void): void {
+  try {
+    step()
+  } catch (cause) {
+    console.error(`Carta: ${what} threw during teardown`, cause)
+  }
+}
+
+/**
+ * The object handed to foliate. `value` is the anchor it resolves; `kind` is
+ * ours, carried through untouched and read back in `draw-annotation`.
+ */
+function annotationFor(
+  anchor: MarkAnchor,
+): { value: string; kind: AnnotationKind; tint: MarkTint; style: MarkStyle } {
+  return { value: anchor.cfi, kind: anchor.kind, tint: anchor.tint, style: anchor.style }
+}
+
+/**
+ * The `kind` a foreign mark carries through foliate.
+ *
+ * ⚠️ **NOT ADDED TO `ANNOTATION_KINDS`, and that is deliberate.** That list is
+ * the STORED mark kinds — what `validMarks` accepts off disk and what
+ * `Mark.kind` may be. A foreign passage is never a stored mark; putting it
+ * there would make every reader of that constant have to remember the
+ * exception. This is a painter kind, and `PAINTABLE_KINDS` is the whitelist
+ * the draw handler checks.
+ */
+const FOREIGN_KIND = 'circle'
+
+/**
+ * What the painter will draw, asked as a WHITELIST.
+ *
+ * ⚠️ The handler's own note explains why this is not "anything that is not the
+ * companion's": classifying by exclusion means a `bookmark` arriving here is
+ * painted as a band over a passage the reader never marked. Widening the
+ * whitelist by one entry keeps that property; widening the *stored* kinds
+ * would not.
+ */
+const PAINTABLE_KINDS: readonly string[] = [...ANNOTATION_KINDS, FOREIGN_KIND]
+
+/**
+ * How many readers a foreign annotation claims, read defensively.
+ *
+ * foliate round-trips the annotation object untyped, so the value arriving at
+ * the painter is not the value the type system saw — the same reason `tintOf`
+ * and `styleOf` exist beside this. One reader is the honest floor: a mark is
+ * on the page because at least one person put it there.
+ */
+function readersOf(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 1 ? value : 1
+}
+
+/** One of the three tints, or yellow — the same default `validMarks` applies. */
+function tintOf(value: unknown): MarkTint {
+  return MARK_TINTS.includes(value as MarkTint) ? (value as MarkTint) : 'yellow'
+}
+
+/** One of the four styles, or a fill — again the default `validMarks` applies. */
+function styleOf(value: unknown): MarkStyle {
+  return MARK_STYLES.includes(value as MarkStyle) ? (value as MarkStyle) : 'fill'
+}
+
+/**
+ * Attach or erase one mark, tolerating an anchor that does not resolve.
+ *
+ * Unlike the silent catches this file has had to remove, this failure is
+ * expected and specific: a CFI addresses a position in a document, and a PDF
+ * page has no text in it until it has been painted. Marks are offered when the
+ * section's overlay is created — before that paint — and offered again once it
+ * lands, which is when they take. Reporting the first attempt would log a line
+ * per mark per page on every book that has any.
+ *
+ * Which is why `report` exists rather than the catch being unconditional. That
+ * reasoning covers the speculative offer and NOTHING else: when the reader
+ * marks a passage, or removes one, a failure means the mark they just made did
+ * not appear, there is no retry coming, and swallowing it leaves them looking
+ * at a page that quietly disagrees with the notes panel.
+ */
+interface AttachOptions {
+  readonly remove?: boolean
+  readonly report?: boolean
+}
+
+/**
+ * Attach or erase one FOREIGN mark.
+ *
+ * ⚠️ **`key` IS SENT AND IS IGNORED UNTIL THE FORK MOVES.** `addAnnotation`
+ * currently keys the Overlayer on `value`, so several readers at one CFI still
+ * collapse into one entry — `review.md`'s overlay blocker 1. `Overlayer.add`
+ * already takes a key separately; the one line that connects them is
+ * `annotation.key ?? annotation.value` in our own fork. Sending it now costs
+ * nothing, changes nothing, and means the day the fork lands no edit is needed
+ * here — which is the difference between a fix that is one commit away and one
+ * that is one commit plus an archaeology session away.
+ *
+ * `report: false`, like the speculative offers `attachMark` makes: a foreign
+ * mark is offered when the overlay is built and again when it lands, and
+ * reporting the first attempt would log a line per mark per page.
+ */
+async function attachForeign(view: View, anchor: ForeignAnchor, remove = false): Promise<boolean> {
+  try {
+    await view.addAnnotation(
+      {
+        value: anchor.cfi,
+        key: anchor.key,
+        kind: FOREIGN_KIND,
+        readers: anchor.readers,
+      },
+      remove,
+    )
+    return true
+  } catch {
+    /* Same expected failure as `attachMark`'s: a CFI addresses a position in a
+       document, and a PDF page has no text until it has been painted.
+       ⚠️ ANSWERED rather than only swallowed — `#drawSection` needs to know
+       whether an ERASE actually happened, because a withdrawal it cannot
+       retry is a mark that stays on the page for ever. Still not reported:
+       these are speculative offers made once per mark per page. */
+    return false
+  }
+}
+
+/**
+ * Which way the marked text runs, as foliate's rule painters ask for it.
+ *
+ * Measured on the element the words are in rather than on `body`, for
+ * `balanceRects`' reason: an EPUB is free to set `writing-mode` on a section,
+ * a pull quote or a single element, so the book's default is not the answer.
+ *
+ * `undefined` when the document cannot be reached, which is exactly what
+ * omitting the option meant — so an unreachable document is the old behaviour
+ * rather than a new failure.
+ */
+function writingModeAt(doc: Document | null, at: Element | null): string | undefined {
+  const view = doc?.defaultView
+  const target = at && at.ownerDocument === doc ? at : doc?.body
+  if (!view || !target) return undefined
+  try {
+    return view.getComputedStyle(target).writingMode || undefined
+  } catch {
+    /* A document torn down between the event and this call has no view to
+       measure with. The rule is still worth drawing; only its side is. */
+    return undefined
+  }
+}
+
+function attachMark(view: View, anchor: MarkAnchor, options: AttachOptions = {}): void {
+  const { remove = false, report = false } = options
+  const fail = (cause: unknown) => {
+    if (report) console.error(`Carta: could not ${remove ? 'erase' : 'draw'} a mark`, cause)
+  }
+  try {
+    const pending = view.addAnnotation(annotationFor(anchor), remove)
+    void pending?.catch?.(fail)
+  } catch (cause) {
+    // Threw synchronously — same case, same reasoning.
+    fail(cause)
+  }
+}
+
+/**
+ * What was closed on a view, so it is never closed twice for the same state —
+ * and IS closed again when startup built something new underneath.
+ *
+ * Both `dispose()` and the post-await `#settle()` can legitimately reach the
+ * same view: dispose closes what it holds, then the in-flight startup resolves
+ * and hands the very same view back. The old `try/catch` hid the second close
+ * rather than preventing it — and a swallowed double-close is precisely the
+ * kind of thing that looks fine until foliate starts throwing on it.
+ *
+ * Keying on the view ALONE was too coarse, and leaked. `dispose()` can close a
+ * view while its `open()`/`init()` is still in flight; that startup then builds
+ * a renderer AFTER the close, and the `#settle()` call that would have released
+ * it was suppressed as a duplicate. The renderer and its iframes survived the
+ * session. So the record is the renderer that was closed, and a later call with
+ * a DIFFERENT renderer — including one where there was none before — is real
+ * work rather than a repeat.
+ */
+const CLOSED = new WeakMap<object, unknown>()
+
+/** `renderer` is a getter that throws before `open()` has built one. */
+function rendererOf(view: View): unknown {
+  try {
+    return view.renderer ?? null
+  } catch {
+    return null
+  }
+}
+
+function closeQuietly(view: View): void {
+  const renderer = rendererOf(view)
+  if (CLOSED.has(view) && CLOSED.get(view) === renderer) return
+  CLOSED.set(view, renderer)
+  try {
+    view.close()
+  } catch {
+    // close() throws when open() never got far enough to build a renderer.
+  }
+  view.remove?.()
+}
+
+/**
+ * Flatten foliate's search stream into plain hits.
+ *
+ * It yields four different shapes — a progress number, a per-section group, a
+ * bare hit, and finally the string 'done' — so the shape has to be narrowed
+ * before anything downstream can render it. Section labels arrive on the group
+ * and are carried onto the hits inside it, which is what lets a result say
+ * which chapter it came from.
+ */
+async function* runSearch(
+  view: View,
+  query: string,
+  signal: AbortSignal,
+): AsyncGenerator<SearchHit> {
+  let label = ''
+  /* Checked BEFORE the iterator exists. `view.search()` clears foliate's own
+   * results and starts walking the book, so entering it on an already-aborted
+   * signal threw away the results still on screen and began work whose every
+   * outcome is discarded. The caller aborts on each keystroke, so this is the
+   * common path, not the rare one. */
+  if (signal.aborted) return
+
+  const results = view.search({ query })
+  /* Closed on the way out, however we leave. A `for await` that returns early
+   * does call `results.return()`, but an abort arriving while we are parked on
+   * the next result is not observed until that result arrives — so the search
+   * runs on after cancellation. Racing the iterator against the abort lets the
+   * cancellation win immediately, and `finally` closes the generator foliate
+   * gave us rather than leaving it walking the book. */
+  const aborted = new Promise<'aborted'>((resolve) => {
+    if (signal.aborted) resolve('aborted')
+    else signal.addEventListener('abort', () => resolve('aborted'), { once: true })
+  })
+
+  try {
+    for (;;) {
+      const step = await Promise.race([results.next(), aborted])
+      if (step === 'aborted' || step.done) return
+      const result = step.value
+      if (signal.aborted) return
+      if (result === 'done') return
+      if (typeof result !== 'object' || result === null) continue
+      if ('progress' in result) continue
+      if ('subitems' in result) {
+        label = result.label ?? ''
+        for (const hit of result.subitems) {
+          if (signal.aborted) return
+          yield toHit(hit, label)
+        }
+        continue
+      }
+      if ('cfi' in result) yield toHit(result, label)
+    }
+  } finally {
+    await results.return?.(undefined)
+  }
+}
+
+function toHit(
+  raw: { cfi: string; excerpt: { pre: string; match: string; post: string } },
+  label: string,
+): SearchHit {
+  return {
+    cfi: raw.cfi,
+    label,
+    pre: raw.excerpt?.pre ?? '',
+    match: raw.excerpt?.match ?? '',
+    post: raw.excerpt?.post ?? '',
+  }
+}
+
+function message(cause: unknown, fallback: string): string {
+  return cause instanceof Error ? cause.message : fallback
+}
+
+/** What a zero-length file is told it is — see `isEmptySource`. */
+const EMPTY_FILE = 'This file is empty.'
+
+/** foliate's metadata is loosely typed: title may be a language map, author a
+ *  string, an object, or an array of either. */
+/**
+ * Give a section document a language when it has not declared one.
+ *
+ * HYPHENATION NEEDS IT AND FAILS SILENTLY WITHOUT IT. `hyphens: auto` asks the
+ * engine to break words by the rules of a language, and with no `lang` there is
+ * no language and therefore no rule — so the setting is applied, reports
+ * nothing, and does nothing. A reader sees justified text with rivers in it and
+ * no way to tell that the control they turned on is inert.
+ *
+ * The book almost always knows. `dc:language` is in the OPF and this app
+ * already parses it into `BookMeta.languages`; a section that omits `xml:lang`
+ * is common in older EPUBs and is exactly the case that goes quiet.
+ *
+ * Only when the document is silent. A section that declares its own language —
+ * a quotation in another one, a bilingual edition — is the authority, and
+ * overwriting it would hyphenate French by English rules.
+ */
+function ensureLang(doc: Document, view: { book?: { metadata?: unknown } }): void {
+  /* A document need not have a root element — a section that failed to parse
+     hands back an empty one, and this runs on every section that loads. */
+  const html = doc.documentElement as HTMLElement | null
+  if (!html) return
+  if (html.getAttribute('lang') || html.getAttribute('xml:lang')) return
+  const declared = readMeta(view.book ?? {}).languages[0]
+  if (!declared) return
+  html.setAttribute('lang', declared)
+}
+
+export function readMeta(book: { metadata?: unknown }): BookMeta {
+  const md = (book.metadata ?? {}) as Record<string, unknown>
+  const text = (value: unknown): string => {
+    if (typeof value === 'string') return value
+    if (Array.isArray(value)) return value.map(text).filter(Boolean).join(', ')
+    if (value && typeof value === 'object') {
+      const rec = value as Record<string, unknown>
+      const name = rec['name']
+      if (typeof name === 'string') return name
+      const first = Object.values(rec)[0]
+      if (typeof first === 'string') return first
+    }
+    return ''
+  }
+  const belongsTo = (md['belongsTo'] ?? {}) as Record<string, unknown>
+  const series = firstOf(belongsTo['series'])
+  return {
+    title: cap(text(md['title'])),
+    author: cap(text(md['author'])),
+    // Loosely typed like the rest: foliate resolves the OPF's unique-identifier
+    // and hands back a string, but a malformed package can put anything here.
+    identifier: cap(typeof md['identifier'] === 'string' ? md['identifier'] : ''),
+    sortAs: cap(text(md['sortAs'])),
+    series: cap(text(series?.['name'] ?? series)),
+    /* A position, not an index into anything: EPUB allows `1.5` for a novella
+     * between two books, so this is a float and NaN must not survive as one. */
+    seriesIndex: finiteOrNull(series?.['position']),
+    subjects: list(md['subject'], text),
+    publisher: cap(text(md['publisher'])),
+    /* Kept as the STRING the book declared, not parsed into a date. EPUB dates
+     * are only loosely specified — `2011`, `2011-03`, and a full timestamp are
+     * all legal — and `new Date('2011')` silently invents a January 1st in
+     * whatever timezone the reader happens to be in. Sorting can compare these
+     * lexically, which is correct for ISO-shaped values and no worse than a
+     * fabricated day for the rest. */
+    published: cap(text(md['published'])),
+    languages: list(md['language'], text),
+    description: cap(text(md['description']), MAX_LONG),
+    subtitle: cap(text(md['subtitle'])),
+    /* Set by `makePdf` and by nothing else, which is exactly the intent: a
+       book either has pages or it does not, and only one format here does. */
+    pageCount: pageCount(md['pageCount']),
+  }
+}
+
+/** A whole number of pages, or 0 for a book that has none. */
+function pageCount(value: unknown): number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : 0
+}
+
+/**
+ * Caps on metadata, because a book is a file a stranger wrote.
+ *
+ * Every field below travels straight from an untrusted OPF into a store that is
+ * read whole, parsed whole and rewritten whole on every position save. Without
+ * a bound, a book declaring a megabyte-long description or forty thousand
+ * subjects would bloat that store permanently — and it would still be there
+ * after the book was removed from the shelf, because the row outlives the open.
+ *
+ * The numbers are chosen to be past anything real rather than to be tight. A
+ * genuine title is not 500 characters and a genuine book is not in 32
+ * languages; the point is only that there IS a ceiling.
+ */
+const MAX_FIELD = 500
+const MAX_LONG = 4000
+const MAX_LIST = 32
+
+function cap(value: string, limit = MAX_FIELD): string {
+  return value.length > limit ? value.slice(0, limit) : value
+}
+
+/** foliate hands back an object, an array of them, or nothing. */
+function firstOf(value: unknown): Record<string, unknown> | null {
+  const one = Array.isArray(value) ? value[0] : value
+  return one && typeof one === 'object' ? (one as Record<string, unknown>) : null
+}
+
+function finiteOrNull(value: unknown): number | null {
+  /* `Number`, not `parseFloat`: the latter reads "1.5junk" as 1.5, and a
+     series position with trailing junk is malformed metadata to refuse, not
+     to half-read (audit round 1, #838). The empty string is `NaN`d explicitly
+     because `Number('')` is 0. */
+  const n = typeof value === 'string' ? (value.trim() === '' ? NaN : Number(value)) : value
+  return typeof n === 'number' && Number.isFinite(n) ? n : null
+}
+
+/** A bounded list of non-empty strings, deduplicated, order preserved. */
+function list(value: unknown, text: (v: unknown) => string): readonly string[] {
+  const raw = Array.isArray(value) ? value : value == null ? [] : [value]
+  const out: string[] = []
+  for (const item of raw) {
+    const one = cap(text(item))
+    // Deduplicated because an OPF may repeat a subject per language, and a tag
+    // shown twice on a row looks like a bug in the reader rather than the book.
+    if (one && !out.includes(one)) out.push(one)
+    if (out.length >= MAX_LIST) break
+  }
+  return out
+}

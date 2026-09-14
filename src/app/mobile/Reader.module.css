@@ -1,0 +1,917 @@
+/* Mobile Reader styles — designed for high-aesthetic iOS/Android reading experience.
+ * Inspired by Koodo Reader, Readest, Apple Books, and WeChat Read.
+ */
+
+.screen {
+  box-sizing: border-box;
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  color: var(--ink);
+  /* Fullscreen paints to the edge, while prose keeps a quiet top margin.
+     These insets stay fixed when controls appear, so menus never reflow text.
+     Extra --space-16 breathing room above safe-area keeps content clear of
+     the front-camera punch-hole and avoids the "too full" feeling at the top. */
+  padding-top: calc(max(var(--space-40), env(safe-area-inset-top)) + var(--space-16));
+  padding-bottom: calc(env(safe-area-inset-bottom) + var(--space-24));
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ── Reading Canvas Stage ─────────────────────────────────────────────────── */
+.stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+  touch-action: pan-y pinch-zoom;
+}
+
+.stage foliate-view::part(filter) {
+  filter: var(--carta-page-filter, none);
+}
+
+/* The paginator caches publisher backgrounds outside the chapter iframe.
+   Paint those gutters with the current theme as well as the page itself.
+   Fixed-layout pages keep their own background and inversion filter. */
+.stage[data-fixed-layout='false'] foliate-view::part(filter) {
+  background: var(--surface) !important;
+}
+
+/* ── Frosted Top Navigation Bar ───────────────────────────────────────────── */
+.topBar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-8);
+  padding: calc(max(var(--space-12), env(safe-area-inset-top)) + var(--space-16)) var(--space-12) var(--space-8);
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  box-shadow: var(--shadow-card);
+  transition: opacity var(--motion-chrome), transform var(--motion-chrome);
+  transform: translateY(0);
+}
+
+.topBar[data-visible='false'] {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-100%);
+}
+
+.backButton {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+  min-height: var(--control-lg);
+  padding: var(--space-4) var(--space-8);
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--accent);
+  font-size: var(--text-ui);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  flex: 0 0 auto;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.backButton:active {
+  background: var(--wash);
+}
+
+.titleBlock {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0 var(--space-4);
+}
+
+.bookTitle {
+  font-size: var(--text-ui);
+  font-weight: var(--weight-semibold);
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.chapterSubtitle {
+  font-size: var(--text-caption);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  margin-top: 1px;
+}
+
+.topActions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex: 0 0 auto;
+}
+
+.iconButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-lg);
+  height: var(--control-lg);
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: background var(--motion-chrome), color var(--motion-chrome);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.iconButton:active {
+  background: var(--wash);
+}
+
+.iconButton[aria-pressed='true'],
+.bookmarkActive {
+  color: var(--amber);
+}
+
+/* ── Ambient Status Line (Fullscreen Immersion Mode) ─────────────────────── */
+.ambientFooter {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-4) calc(var(--space-16) + env(safe-area-inset-right)) calc(env(safe-area-inset-bottom) + var(--space-4)) calc(var(--space-16) + env(safe-area-inset-left));
+  font-size: var(--text-caption);
+  color: var(--muted);
+  pointer-events: none;
+  opacity: var(--opacity-quiet);
+  transition: opacity var(--motion-chrome);
+}
+
+.ambientFooter[data-visible='false'] {
+  opacity: 0;
+}
+
+.ambientChapter {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+
+.ambientProgress {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Frosted Bottom Control Console ───────────────────────────────────────── */
+.bottomConsole {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  box-shadow: var(--shadow-pop);
+  padding: var(--space-10) var(--space-16) calc(env(safe-area-inset-bottom) + var(--space-8));
+  gap: var(--space-8);
+  transition: opacity var(--motion-chrome), transform var(--motion-chrome);
+  transform: translateY(0);
+}
+
+.bottomConsole[data-visible='false'] {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(100%);
+}
+
+/* ── Progress Scrubber Row ───────────────────────────────────────────────── */
+.scrubberRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-12);
+  width: 100%;
+}
+
+.stepNavButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--control-sm);
+  height: var(--control-sm);
+  padding: 0 var(--space-8);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-control);
+  background: var(--wash);
+  color: var(--ink-2);
+  font-size: var(--text-caption);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.stepNavButton:disabled {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+.stepNavButton:not(:disabled):active {
+  background: var(--line);
+}
+
+.sliderContainer {
+  position: relative;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+}
+
+.scrubberInput {
+  width: 100%;
+  height: var(--space-20);
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  margin: 0;
+}
+
+.scrubberInput:focus {
+  outline: none;
+}
+
+.scrubberInput::-webkit-slider-runnable-track {
+  width: 100%;
+  height: var(--space-6);
+  background: var(--line-2);
+  border-radius: var(--radius-pill);
+}
+
+.scrubberInput::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: var(--space-20);
+  height: var(--space-20);
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--accent);
+  box-shadow: var(--shadow-card);
+  margin-top: calc(-1 * var(--space-6));
+  transition: transform 0.1s ease;
+}
+
+.scrubberInput:active::-webkit-slider-thumb {
+  transform: scale(1.2);
+  background: var(--accent);
+}
+
+.scrubberInput::-moz-range-track {
+  width: 100%;
+  height: var(--space-6);
+  background: var(--line-2);
+  border-radius: var(--radius-pill);
+}
+
+.scrubberInput::-moz-range-thumb {
+  width: var(--space-20);
+  height: var(--space-20);
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--accent);
+  box-shadow: var(--shadow-card);
+}
+
+/* ── Progress Meta Row ───────────────────────────────────────────────────── */
+.progressMetaRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: var(--text-caption);
+  color: var(--muted);
+  padding: 0 var(--space-2);
+}
+
+.metaChapterLabel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 65%;
+}
+
+.metaPercentInfo {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Bottom Action Toolbar ───────────────────────────────────────────────── */
+.bottomToolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  padding-top: var(--space-6);
+  border-top: 1px solid var(--line);
+}
+
+.toolbarAction {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-width: var(--space-56);
+  padding: var(--space-4) var(--space-6);
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: color var(--motion-chrome), background var(--motion-chrome);
+}
+
+.toolbarAction:active {
+  background: var(--wash);
+}
+
+.toolbarAction[aria-pressed='true'] {
+  color: var(--accent);
+}
+
+.toolbarActionLabel {
+  font-size: var(--text-micro);
+  font-weight: var(--weight-medium);
+  letter-spacing: normal;
+}
+
+/* ── Segmented Navigation (for Sheets) ───────────────────────────────────── */
+.segmentedNav {
+  display: flex;
+  align-items: center;
+  background: var(--wash);
+  border-radius: var(--radius-control);
+  padding: var(--space-2);
+  margin-bottom: var(--space-12);
+  gap: var(--space-2);
+}
+
+.segmentBtn {
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  height: var(--control-sm);
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--text-small);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.segmentBtnActive {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-pill);
+}
+
+.segmentCountBadge {
+  font-size: var(--text-micro);
+  padding: 1px var(--space-6);
+  border-radius: var(--radius-pill);
+  background: var(--line);
+  color: var(--muted);
+}
+
+.segmentBtnActive .segmentCountBadge {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+/* ── Content & Marks Lists ───────────────────────────────────────────────── */
+.itemList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding-bottom: var(--space-20);
+}
+
+.tocRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-10) var(--space-12);
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--ink);
+  font-size: var(--text-ui);
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+  transition: background 0.12s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.tocRow:active {
+  background: var(--wash);
+}
+
+.tocRowActive {
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-weight: var(--weight-semibold);
+}
+
+.tocActiveDot {
+  width: var(--space-6);
+  height: var(--space-6);
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 auto;
+  margin-right: var(--space-6);
+}
+
+.markCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  padding: var(--space-12);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.markCard:active {
+  background: var(--wash);
+}
+
+.markCardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.markChapterBadge {
+  font-size: var(--text-caption);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.markDeleteBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-sm);
+  height: var(--control-sm);
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.markDeleteBtn:hover,
+.markDeleteBtn:active {
+  color: var(--danger);
+  background: var(--wash);
+}
+
+.markQuote {
+  font-size: var(--text-ui);
+  line-height: 1.45;
+  color: var(--ink);
+  border-left: 3px solid var(--accent);
+  padding-left: var(--space-8);
+  margin: 0;
+}
+
+.markNoteComment {
+  font-size: var(--text-small);
+  color: var(--ink-2);
+  background: var(--wash);
+  border-radius: var(--radius-control);
+  padding: var(--space-6) var(--space-8);
+}
+
+.emptyNotice {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-32) var(--space-16);
+  text-align: center;
+  color: var(--muted);
+  gap: var(--space-8);
+}
+
+.emptyNoticeText {
+  font-size: var(--text-ui);
+  line-height: 1.5;
+}
+
+/* ── Mobile Appearance & Typography Sheet ────────────────────────────────── */
+.appearanceCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-16);
+  padding: var(--space-8) 0 var(--space-20);
+}
+
+.settingSection {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+}
+
+.sectionHeader {
+  font-size: var(--text-caption);
+  font-weight: var(--weight-medium);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: var(--track-caps);
+}
+
+.themeSwatches {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: var(--space-8);
+}
+
+.themeSwatch {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-6);
+  padding: var(--space-8) var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.themeSwatchActive {
+  border-color: var(--accent);
+  outline: var(--focus-ring);
+}
+
+.swatchCircle {
+  width: var(--space-24);
+  height: var(--space-24);
+  border-radius: 50%;
+  border: 1px solid var(--line-3);
+  display: grid;
+  place-items: center;
+}
+
+.swatchLabel {
+  font-size: var(--text-caption);
+  color: var(--ink);
+}
+
+.followOsRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-8) var(--space-12);
+  background: var(--wash);
+  border-radius: var(--radius-control);
+  font-size: var(--text-ui);
+}
+
+.toggleSwitch {
+  width: var(--control-lg);
+  height: var(--control-xs);
+  border-radius: var(--radius-pill);
+  background: var(--line-3);
+  border: none;
+  cursor: pointer;
+  position: relative;
+  padding: var(--space-2);
+  transition: background 0.2s ease;
+}
+
+.toggleSwitch[aria-checked='true'] {
+  background: var(--accent);
+}
+
+.toggleHandle {
+  width: var(--space-20);
+  height: var(--space-20);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  box-shadow: var(--shadow-pill);
+  transition: transform 0.2s ease;
+  display: block;
+}
+
+.toggleSwitch[aria-checked='true'] .toggleHandle {
+  transform: translateX(var(--space-20));
+}
+
+.stepperRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--wash);
+  border-radius: var(--radius-control);
+  padding: var(--space-4);
+}
+
+.stepperBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--control-lg);
+  height: var(--control-lg);
+  border: none;
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: var(--text-ui);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  box-shadow: var(--shadow-pill);
+}
+
+.stepperBtn:disabled {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+.stepperBtn:not(:disabled):active {
+  background: var(--line);
+}
+
+.stepperLabel {
+  font-size: var(--text-ui);
+  font-weight: var(--weight-medium);
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.chipsGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-6);
+}
+
+.chipBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--control-lg);
+  padding: 0 var(--space-8);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--wash);
+  color: var(--ink-2);
+  font-size: var(--text-ui);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.chipBtnActive {
+  background: var(--surface);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: var(--weight-semibold);
+  box-shadow: var(--shadow-pill);
+}
+
+.brightnessRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-12);
+  background: var(--wash);
+  border-radius: var(--radius-control);
+  padding: var(--space-8) var(--space-16);
+}
+
+/* ── Problem Warning Banner ──────────────────────────────────────────────── */
+.problem {
+  position: absolute;
+  left: var(--space-8);
+  right: var(--space-8);
+  bottom: calc(env(safe-area-inset-bottom) + var(--space-16));
+  z-index: 20;
+  display: flex;
+  gap: var(--space-8);
+  align-items: center;
+  justify-content: space-between;
+  font-size: var(--text-ui);
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  padding: var(--space-8) var(--space-12);
+  box-shadow: var(--shadow-pop);
+}
+
+/* ── Backwards Compatible Tools Bottom Sheet Styles ──────────────────────── */
+.toolBody {
+  padding: var(--space-8) var(--space-16) var(--space-28);
+}
+
+.toolTabs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: calc(var(--control-lg) + var(--space-12));
+  padding: 0 var(--space-10);
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.toolTab {
+  flex: 1 1 0;
+  display: grid;
+  place-items: center;
+  height: calc(var(--control-sm) + var(--space-12));
+  border: 0;
+  border-radius: var(--radius-control);
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.toolTab[aria-pressed='true'] {
+  background: var(--wash);
+  color: var(--accent);
+}
+
+/* ── Note Editor Modal / Bottom Sheet ────────────────────────────────────── */
+.noteSheetBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-12);
+  padding: var(--space-4) var(--space-16) var(--space-20);
+}
+
+.noteSheetHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.noteSheetTitle {
+  margin: 0;
+  font-size: var(--text-ui);
+  font-weight: var(--weight-semibold);
+  color: var(--ink);
+}
+
+.noteSheetTints {
+  display: flex;
+  align-items: center;
+  gap: var(--space-8);
+}
+
+.noteSheetSwatch {
+  width: var(--control-sm);
+  height: var(--control-sm);
+  border: 0;
+  border-radius: var(--radius-pill);
+  box-shadow: inset 0 0 0 1px var(--line-3);
+  cursor: pointer;
+}
+
+.noteSheetSwatch[data-tint='yellow'] {
+  background: var(--mark-yellow, #fde047);
+}
+
+.noteSheetSwatch[data-tint='green'] {
+  background: var(--mark-green, #86efac);
+}
+
+.noteSheetSwatch[data-tint='purple'] {
+  background: var(--mark-purple, #d8b4fe);
+}
+
+.noteSheetSwatch[aria-pressed='true'] {
+  box-shadow:
+    inset 0 0 0 1px var(--line-3),
+    0 0 0 2px var(--ink);
+}
+
+.noteSheetQuote {
+  font-size: var(--text-small);
+  line-height: 1.45;
+  color: var(--ink);
+  border-left: var(--track-w) solid var(--accent);
+  padding-left: var(--space-8);
+  margin: 0;
+  max-height: calc(3 * var(--space-24));
+  overflow-y: auto;
+}
+
+.noteTextarea {
+  width: 100%;
+  min-height: calc(4 * var(--space-24));
+  padding: var(--space-10) var(--space-12);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: var(--text-ui);
+  line-height: 1.5;
+  resize: none;
+  outline: none;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+.noteTextarea:focus {
+  border-color: var(--accent);
+}
+
+.noteSheetActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-12);
+  padding-top: var(--space-4);
+}
+
+.noteCancelBtn {
+  padding: var(--space-8) var(--space-16);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: var(--text-ui);
+  cursor: pointer;
+}
+
+.noteSaveBtn {
+  padding: var(--space-8) var(--space-20);
+  border: none;
+  border-radius: var(--radius-control);
+  background: var(--accent);
+  color: #ffffff;
+  font-size: var(--text-ui);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+}
+
+.markActionBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-sm);
+  height: var(--control-sm);
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.markActionBtn:hover,
+.markActionBtn:active {
+  color: var(--accent);
+  background: var(--wash);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .topBar,
+  .bottomConsole,
+  .ambientFooter {
+    transition: none;
+  }
+}
