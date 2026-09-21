@@ -72,10 +72,10 @@
 }
 
 .title {
-  padding-top: var(--space-6);
-  font-size: var(--text-caption);
-  font-weight: var(--weight-medium);
-  line-height: 1.25;
+  padding-top: var(--space-8);
+  font-size: var(--text-small);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-snug);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -95,8 +95,8 @@
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
   overflow: hidden;
-  padding: var(--space-6);
-  font-size: var(--text-micro);
-  line-height: 1.25;
+  padding: var(--space-8);
+  font-size: var(--text-caption);
+  line-height: var(--leading-snug);
   color: var(--ink-2);
 }

@@ -45,7 +45,7 @@ export function createDownloads(): Downloads {
   const active = new Map<string, Downloading>()
   const listeners = new Set<() => void>()
   const publish = () => {
-    for (const listener of [...listeners]) listener()
+    notifyAll(listeners, 'downloads')
   }
 
   return {
@@ -91,3 +91,4 @@ export function describeDownload(one: Downloading): { label: string; fraction?: 
      fraction; only the words are conservative. */
   return { label: `Downloading ${Math.floor(fraction * 100)}%`, fraction }
 }
+import { notifyAll } from '../../../kernel'

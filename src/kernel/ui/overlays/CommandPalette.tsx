@@ -22,8 +22,8 @@ export interface CommandPaletteProps {
   /** Which accelerator glyph the combos are printed with. */
   platform: Platform
   onDismiss: () => void
-  /** Hand an unmatched query to the companion panel. */
-  onAsk: (question: string) => void
+  /** Hand an unmatched query to a question surface, when this build has one. */
+  onAsk?: (question: string) => void
 }
 
 export function CommandPalette({ commands, platform, onDismiss, onAsk }: CommandPaletteProps) {
@@ -88,7 +88,7 @@ export function CommandPalette({ commands, platform, onDismiss, onAsk }: Command
     if (event.key === 'Enter') {
       event.preventDefault()
       if (matches.length > 0) run(matches[activeIdx])
-      else if (query.trim()) {
+      else if (query.trim() && onAsk) {
         onDismiss()
         onAsk(query.trim())
       }
@@ -122,8 +122,12 @@ export function CommandPalette({ commands, platform, onDismiss, onAsk }: Command
             {query.trim() ? (
               <>
                 No command matches “{query.trim()}”.
-                <br />
-                Press Enter to take it to the companion.
+                {onAsk ? (
+                  <>
+                    <br />
+                    Press Enter to ask.
+                  </>
+                ) : null}
               </>
             ) : (
               'Type to search commands.'

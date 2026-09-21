@@ -1,5 +1,4 @@
-import { BOOK_MAX_BYTES, tooLarge } from '../../kernel'
-import { ServiceCallError } from '../../kernel/core/envelope'
+import { BOOK_MAX_BYTES, ServiceCallError, tooLarge } from '../../kernel'
 import type { ShelfChannel } from './channel'
 
 /**

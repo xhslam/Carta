@@ -2,14 +2,11 @@ import { messageOf } from './messageOf'
 import type { IndexFs, IndexedBook } from './bookIndex'
 import type { Disposable, ServiceContribution } from './capability'
 import { createCards, type CardStorage, type Cards } from './cardStore'
-import { type Hlc, makeHlc, ZERO_DEVICE, HLC_MAX_COUNTER } from './hlc'
+import { type Hlc, compareHlc, deviceOf, laterHlc, makeHlc, parseHlc, ZERO_DEVICE, HLC_MAX_COUNTER } from './hlc'
 import { createLibrary, type Library } from './libraryStore'
 import { createMarkStore, type MarkStore } from './markStore'
 import { folderOf, readBook, recordPath } from './bookFolder'
-import { NOT_CONFIGURED, type CompanionProvider } from './companion'
-import { NO_GLOSS, type GlossProvider } from './gloss'
 import {
-  NO_WORK_LINE,
   NOOP_DIAGNOSTICS,
   NOOP_RECORDER,
   REMOVABLE_BLOB_KINDS,
@@ -24,7 +21,6 @@ import {
   type ShelfPort,
   type HashPort,
   type SizePort,
-  type WorkLine,
 } from './ports'
 import { carryLegacySettings, createSettingsStore, type SettingsMigration } from './settings'
 import { writeQueue, type WriteQueue } from './writeQueue'
@@ -109,8 +105,12 @@ export interface KernelServices {
    * shape, same once-at-a-time rule, and the same restoring disposer as
    * `bindRecorder`. Until bound, stamps are the legacy wall clock under the
    * zero device (`hlcOf`), which is enough with no sync composed.
+   *
+   * `witness`, when the clock has one, is how the port tells it a floor: a clock
+   * bound behind the newest stamp already handed out is told that stamp and
+   * asked again, so the clock's own persisted floor learns it (`flooredClock`).
    */
-  bindClock(clock: () => Hlc): Disposable
+  bindClock(clock: () => Hlc, witness?: (stamp: Hlc) => void): Disposable
   /**
    * A stamp from THE clock — the one every store stamps with.
    *
@@ -127,8 +127,11 @@ export interface KernelServices {
    * Bind the SERVICE HOST — the peer transport, at composition. A shelf serves
    * the capabilities' contributed `services` over the peer router; the host is
    * what turns a `ServiceContribution` set into served, grant-gated handlers.
-   * Late-bound and once-at-a-time like the recorder, with the same restoring
-   * disposer. Until bound (a browser tab, a satchel with no peer plugin, every
+   * Late-bound like the recorder, and — unlike it — NOT once-at-a-time: every
+   * transport binds its own host (the peer plugin, and the browser client's
+   * webhost beside it), and `serveServices` hands the composed set to each. The
+   * disposer removes THIS binding and no other, and is idempotent; there is no
+   * previous target to restore. Until bound (a browser tab, a satchel with no peer plugin, every
    * test that composes without `peer`) the default hosts NOTHING — replication
    * is the spine and services are enhancement, so an unbound host is not an
    * error, it is the offline case.
@@ -162,60 +165,6 @@ export interface KernelServices {
   bindHashPort(port: HashPort): Disposable
   hashes(): HashPort | null
   /**
-   * Bind the COMPANION provider — `companion`, at composition, and only
-   * `companion`. Same late-bound, once-at-a-time rule and the same restoring
-   * disposer as `bindRecorder`.
-   *
-   * The kernel holds this from birth so that one bind reaches every holder:
-   * `companion.ts` shipped `NOT_CONFIGURED` as a hardcoded const, which is
-   * why wiring a provider used to mean editing the kernel. Until bound, the
-   * default is `NOT_CONFIGURED` and the panel says what is missing.
-   */
-  bindCompanion(provider: CompanionProvider): Disposable
-  /** The companion provider — `NOT_CONFIGURED` until one is bound. */
-  companion(): CompanionProvider
-  /**
-   * Bind the GLOSS provider — `inference`, at composition, and only
-   * `inference`.
-   *
-   * SEPARATE FROM THE COMPANION ON PURPOSE (F8). The two features fail
-   * separately because they are two features: with `companion` absent, failed,
-   * or set to an agent, the gloss still works. And because only `inference`
-   * binds this, there is no code path from a selection to an agent session —
-   * a property of the wiring rather than a rule someone has to remember.
-   */
-  bindGloss(provider: GlossProvider): Disposable
-  /**
-   * Bind the WORK LINE — the library status bar's third rung (WI-15.12).
-   *
-   * Same late-bound, once-at-a-time rule and the same restoring disposer as
-   * `bindRecorder`. Until bound the default reports nothing, and the bar is
-   * exactly the two-rung ladder it has always been.
-   */
-  bindWorkLine(work: WorkLine): Disposable
-  /** The work line — `NO_WORK_LINE` until one is bound. */
-  workLine(): WorkLine
-  /**
-   * The gloss provider — `NO_GLOSS` until one is bound.
-   *
-   * ⚠️ **THERE ARE NO LOOK-UP ACCESSORS BESIDE THIS ANY MORE.** `lookUp()`,
-   * `cycleLookUp()` and `hasDictionary()` were here so that `inference` and
-   * `companion` could draw a settings row cycling between the system
-   * dictionary, the gloss and both — a value they could not reach through
-   * `services.settings`, because `scopeSettings` confines a capability to its
-   * own `<id>.` namespace and the setting was `kernel.lookUp`.
-   *
-   * All three are deleted with the mode they served. What is worth keeping
-   * from the episode is why `hasDictionary` was on this interface at all: it
-   * was a fact the composition root worked out and passed down, it defaulted
-   * to `false` on the way, and the production caller forgot to pass it — so on
-   * macOS the system dictionary silently vanished from the cycle. The
-   * replacement fact lives on the provider (`GlossProvider.installable`),
-   * where the object that knows the answer is the one that states it and no
-   * caller can default it wrong.
-   */
-  gloss(): GlossProvider
-  /**
    * Serve a composed set of services through the bound host, once every
    * capability has started (so a delegating handler's target is ready). The
    * registry calls this with `Composition.services`; the returned `Disposable`
@@ -224,8 +173,10 @@ export interface KernelServices {
    */
   serveServices(services: readonly ServiceContribution[]): Promise<Disposable>
   /**
-   * Resolves when nothing is in flight — the queue idle AND the flat store
-   * flushed. For the one moment that cannot be deferred: the window closing.
+   * Resolves when nothing is in flight — the index flushed, the queue idle AND
+   * the flat store flushed. For the one moment that cannot be deferred: the
+   * window closing. Every stage is attempted even when an earlier one fails;
+   * the failures are raised afterwards.
    */
   drain(): Promise<void>
 }
@@ -274,23 +225,6 @@ export interface KernelServicesOptions {
  * owned, so firing it after a re-bind let a second simultaneous binding in.
  * Here the flag and the target move together, only under the disposer that
  * still owns the active binding.
- */
-/**
- * Which binding issued each token, held BESIDE the token rather than on it.
- *
- * ⚠️ **THE TOKEN USED TO BE CLONED.** `{ ...token, [BINDING]: at }` returns a
- * different object from the one the recorder minted, which breaks every
- * recorder whose token is more than a bag of enumerable fields: one that keys
- * a `Map` by identity, one that hands back a class instance with a prototype,
- * one with a non-enumerable id. Each would be handed something it did not
- * issue and would rightly refuse to commit it — after the file write, so the
- * mutation is durable, unjournalled, and reported as a failure.
- *
- * `MutationToken` is an interface, so the kernel does not get to assume the
- * shape behind it. A `WeakMap` records the generation without touching the
- * value, and the token that reaches `commit` is byte-for-byte the one `begin`
- * returned. Weak because the entry should die with the token; a bracket left
- * open by a crash must not pin one forever.
  */
 function exclusiveSlot<T>(
   alreadyBound: string,
@@ -342,58 +276,80 @@ function routedRecorder(
   slot: { get(): MutationRecorder; generation(): number },
   fallback: MutationRecorder,
 ): MutationRecorder {
-  /* PER RECORDER PORT, not module-wide. Token uniqueness is not something
+  /**
+   * Which binding issued each token, held BESIDE the token rather than on it.
+   *
+   * ⚠️ **THE TOKEN USED TO BE CLONED.** `{ ...token, [BINDING]: at }` returns a
+   * different object from the one the recorder minted, which breaks every
+   * recorder whose token is more than a bag of enumerable fields: one that keys
+   * a `Map` by identity, one that hands back a class instance with a prototype,
+   * one with a non-enumerable id. Each would be handed something it did not
+   * issue and would rightly refuse to commit it — after the file write, so the
+   * mutation is durable, unjournalled, and reported as a failure.
+   *
+   * `MutationToken` is an interface, so the kernel does not get to assume the
+   * shape behind it. A `WeakMap` records the generation and the issuer without
+   * touching the value, and the token that reaches `commit` is byte-for-byte
+   * the one `begin` returned.
+   *
+   * PER RECORDER PORT, not module-wide. Token uniqueness is not something
    * `MutationRecorder` promises, so a recorder that reused one token object
    * across two `KernelServices` instances had each overwriting the other's
    * routing generation in a shared map. Weak, so an entry dies with its
-   * token — a bracket left open by a crash must not pin one forever. */
-  const issuedAt = new WeakMap<MutationToken, number>()
-  /* A COMMIT GOES TO THE RECORDER THAT ISSUED ITS BEGIN, OR TO THE DEFAULT —
-   * never to a DIFFERENT one.
+   * token — a bracket left open by a crash must not pin one forever.
+   */
+  const issuedAt = new WeakMap<MutationToken, { readonly at: number; readonly by: MutationRecorder }>()
+  /* A COMMIT GOES TO THE RECORDER THAT ISSUED ITS BEGIN, OR TO NOBODY — never
+   * to a recorder that did not issue it.
    *
    * The first rule here was "each end resolves the current slot", and its
    * reasoning still holds for the case it was written for: an UNBIND between
-   * begin and commit sends the commit to the restored default, leaving a
-   * dangling begin, which is exactly the shape the journal's launch recovery
-   * exists for — a crash leaves the same. The alternative tried before that,
-   * routing a commit back to the recorder that issued it, sent it into a
-   * journal that had since CLOSED: a recoverable gap turned into a rejected
-   * write whose bytes were already down.
+   * begin and commit must not reach the issuing journal, which may have CLOSED.
+   * Routing a commit back to its issuer regardless, tried before that, turned a
+   * recoverable gap into a rejected write whose bytes were already down.
    *
-   * Neither rule covered the third case. A REBIND — unbind then bind, which
-   * is every capability reload — leaves the slot holding a different, live
-   * journal. "Resolve the current slot" then hands that journal a token it
-   * never issued, and it rejects it: the file write has already happened, so
-   * the mutation is durable and unjournalled, and the rejection surfaces as a
-   * write failure for something that did not fail.
+   * A REBIND — unbind then bind, which is every capability reload — was the
+   * second case: "resolve the current slot" handed a different, live journal a
+   * token it never issued, and it rejected it after the file write had landed.
    *
-   * The generation is what tells the three apart. Same generation: the
-   * issuing recorder is still bound, commit to it. Different: fall through to
-   * the DEFAULT, which is where an unbind already sent it — a dangling begin
-   * in the old journal, nothing bogus in the new one, and recovery handles
-   * both because it cannot tell them from a crash. */
+   * ⚠️ **AND THE FIX FOR THAT SENT THE TOKEN TO THE DEFAULT, WHICH NEVER ISSUED
+   * IT EITHER.** That was harmless only while the default was the no-op; a
+   * composition that passes a real recorder as `recorder` got the same foreign
+   * token and the same rejection after the write. Measured with an identity-
+   * checking default. Found by audit.
+   *
+   * So there are three answers, and the entry tells them apart. The issuing
+   * binding still bound (same generation): commit to it. Issued by the DEFAULT:
+   * commit to the default, which is never unbound and so never closes, however
+   * often the slot has moved since. Issued by a binding that has since been
+   * RETIRED: commit to nobody. The old journal keeps a dangling begin, which is
+   * exactly what a crash leaves and what its launch recovery settles — and no
+   * other recorder is handed something it did not issue. A token this port has
+   * no entry for was issued by nobody it knows, and gets the same answer. */
   return {
     begin: async (book, what) => {
       const at = slot.generation()
-      const token = await slot.get().begin(book, what)
+      const by = slot.get()
+      const token = await by.begin(book, what)
       /* THE RECORDER'S OWN OBJECT, UNTOUCHED — see `issuedAt`. */
-      issuedAt.set(token, at)
+      issuedAt.set(token, { at, by })
       return token
     },
     commit: (token: MutationToken, digest?: string) => {
-      /* A token this port never issued has no generation, so it cannot match
-         one — and falls through to the default, which is the same answer an
-         unbind gets and the one recovery already understands. */
-      const at = issuedAt.get(token)
-      const target = at === slot.generation() ? slot.get() : fallback
-      return target.commit(token, digest)
+      const issued = issuedAt.get(token)
+      /* A TOKEN THIS PORT HAS NO ENTRY FOR gets the retired bracket's answer:
+         commit to nobody. Asked as `issued === undefined` on a line of its own,
+         which decided nothing this one does not — neither arm can match an
+         entry that is not there, `at` being a number and `by` an object. */
+      // Stryker disable next-line OptionalChaining: with no entry the arms answer `undefined === <number>` and `undefined === <the fallback>`, which is the same nobody.
+      if (issued?.at === slot.generation() || issued?.by === fallback) return issued.by.commit(token, digest)
+      return Promise.resolve()
     },
   }
 }
 
 /** What `removeBlob` needs of the services being built around it. */
 interface BlobRemoval {
-  readonly fs: IndexFs | null
   readonly library: Library
   readonly recorder: MutationRecorder
 }
@@ -409,14 +365,18 @@ interface BlobRemoval {
  * thing in `createKernelServices` and the only one that did any work.
  */
 async function removeBlob(
-  { fs, library, recorder }: BlobRemoval,
+  { library, recorder }: BlobRemoval,
   bookId: string,
   name: RemovableBlobName,
 ): Promise<void> {
     if (!REMOVABLE_BLOB_NAMES.has(name)) {
       throw new Error(`removeBlob: ${JSON.stringify(name)} is not a blob the kernel removes`)
     }
-    if (!fs) return
+    /* NO FILESYSTEM IS THE LANE'S NO-OP, NOT A CHECK OF ITS OWN. This returned
+     * early on `!fs`, ahead of a lane — `library.updateAfter` — that answers
+     * nothing without one and never runs a hook, so the early return decided
+     * nothing the lane had not already decided. The refusal of a name above
+     * still comes first, filesystem or none. */
     /* ⚠️ **AN ALIAS MUST NOT REACH ANOTHER BOOK'S FOLDER.** `folderOf`
      * sanitises an id into `books/<safeId>` — a slash, a dot, anything
      * outside [A-Za-z0-9] becomes `_` — which stops traversal and does NOT
@@ -438,6 +398,7 @@ async function removeBlob(
      * the other way round owns these very bytes. Compared exactly, the guard
      * looked straight past it. `book.add` and the store's lane key fold for
      * the same reason. */
+    // Stryker disable next-line MethodExpression: `folderOf` answers ASCII letters, digits, `_` and `/` alone, so folding either way groups exactly the same names.
     const owner = (id: string) => folderOf(id).toLowerCase()
     const mine = owner(bookId)
     const claimant = () => library.getSnapshot().find((one) => owner(one.bookId) === mine && one.bookId !== bookId)
@@ -536,9 +497,14 @@ async function removeBlob(
              (a legacy `cover.webp` beside the honest `cover.jpg`), and clearing
              whatever facts were there when the legacy one went discarded the
              JPEG's valid measurement. A record carrying no facts of this name
-             is not written, so an ordinary removal costs no record bracket. */
-          if (kind !== 'cover') return 'refuse'
-          return record?.coverFacts?.name === name ? 'go' : 'refuse'
+             is not written, so an ordinary removal costs no record bracket —
+             and a content removal never writes one: a record's facts only ever
+             name a cover, since `parseCoverFacts` refuses any other name. (A
+             separate `kind !== 'cover'` refusal stood here and decided nothing
+             this line does not.) */
+          if (record?.coverFacts?.name !== name) return 'refuse'
+          // Stryker disable next-line StringLiteral: the lane refuses on `'refuse'` alone, so any other answer lets the record write go ahead.
+          return 'go'
         },
         /* ⚠️ **THE FACTS FIRST, THE FILE SECOND.** Two brackets, each honest
            about its kind, and the record's before the cover's: a crash or a
@@ -598,6 +564,88 @@ export function monotonicClock(): () => Hlc {
   }
 }
 
+/**
+ * The clock port every store stamps through: the bound clock, never handing
+ * out a stamp at or before one it already has — across a change of binding.
+ *
+ * ⚠️ **A BINDING CHANGE SENT STAMPS BACKWARDS.** The port read the slot and
+ * nothing else. The sync capability's HLC runs ahead of wall time once it has
+ * met a peer whose clock is ahead, and unbinding it restored the wall clock
+ * under it — so the next edit was stamped EARLIER than the last, and a
+ * last-writer-wins merge preferred the edit that came first. A clock bound
+ * behind the last stamp did the same. Measured with a bound clock one minute
+ * ahead. Found by audit.
+ *
+ * WITHIN ONE BINDING THE CLOCK IS TRUSTED AS IT IS. Every clock bound here is
+ * monotonic on its own terms, and a port that second-guessed one would be a
+ * second clock beside it — `ONE CLOCK PER DEVICE` is the rule this port exists
+ * for. What it owns is the SEAM: a clock newly in the slot is held above the
+ * newest stamp handed out before it, by counter, as an HLC holds a physical
+ * clock that is behind; once its own stamps overtake, it is trusted again.
+ *
+ * ⚠️ **AND IT TELLS THE CLOCK, WHICH IT COULD NOT.** A `() => Hlc` had no way to
+ * be told a floor, so the sync HLC's persisted floor never learned a stamp this
+ * port raised, and a relaunch inside that window could issue it again
+ * (2026-09-13 verify). A clock bound with a `witness` is told the newest stamp
+ * and asked again, so what is handed out is the clock's own stamp and its floor
+ * is saved past it. Only a clock that cannot be told — the legacy default, or a
+ * witness that moves nothing — is held above by counter here.
+ */
+function flooredClock(slot: { get(): BoundClock; generation(): number }): () => Hlc {
+  /* The highest stamp handed out, which is the floor a later binding is held
+     above — `undefined` until one has been. Kept with `laterHlc`, the store's
+     own rule for which of two stamps is the later: spelled out here as a
+     comparison, the two answers agreed for every pair, since the same stamp by
+     either name is the same string. */
+  let newest: Hlc | undefined
+  /* The binding whose stamps are passed through untouched. Starts as the one
+     in the slot at birth, which has handed out nothing to be held above. */
+  let trusted = slot.generation()
+  return () => {
+    const generation = slot.generation()
+    const bound = slot.get()
+    const stamp = bound.now()
+    if (generation === trusted || newest === undefined || compareHlc(stamp, newest) > 0) {
+      trusted = generation
+      newest = laterHlc(newest, stamp)
+      return stamp
+    }
+    const told = tell(bound, newest)
+    if (compareHlc(told, newest) > 0) {
+      trusted = generation
+      newest = told
+      return told
+    }
+    const { ms, counter } = parseHlc(newest)
+    newest = counter < HLC_MAX_COUNTER ? makeHlc(ms, counter + 1, deviceOf(stamp)) : makeHlc(ms + 1, 0, deviceOf(stamp))
+    return newest
+  }
+}
+
+/** A stamp clock as the port holds it: the clock, and how to tell it a floor when it can be told one. */
+interface BoundClock {
+  readonly now: () => Hlc
+  readonly witness?: ((stamp: Hlc) => void) | undefined
+}
+
+/**
+ * Tell a clock a floor and ask it again — or answer the floor itself for a clock
+ * that cannot be told, which is never past it and so is held above like any
+ * clock that did not move. (This answered `null` for that clock, and the caller
+ * tested for it before comparing — but `compareHlc` answers 0 for `null` against
+ * any stamp, so the test decided nothing the comparison did not.)
+ *
+ * A WITNESS THAT THROWS IS NOT CAUGHT. The sync HLC refuses only a stamp
+ * implausibly far ahead of its wall, which no clock bound here hands out; a clock
+ * refusing its floor is a fault to surface at the write, not one to paper over
+ * with a stamp the clock never agreed to.
+ */
+function tell(bound: BoundClock, floor: Hlc): Hlc {
+  if (bound.witness === undefined) return floor
+  bound.witness(floor)
+  return bound.now()
+}
+
 export function createKernelServices({
   fs,
   storage,
@@ -613,10 +661,11 @@ export function createKernelServices({
    * slot's default target is what an unbind RESTORES. */
   const recorderSlot = exclusiveSlot<MutationRecorder>('bindRecorder: the recorder port is already bound', recorder)
   const recorderPort = routedRecorder(recorderSlot, recorder)
-  const clockSlot = exclusiveSlot<() => Hlc>('bindClock: the clock port is already bound', clock ?? monotonicClock())
-  const clockPort = () => clockSlot.get()()
+  const clockSlot = exclusiveSlot<BoundClock>('bindClock: the clock port is already bound', {
+    now: clock ?? monotonicClock(),
+  })
+  const clockPort = flooredClock(clockSlot)
 
-  const NOOP_DISPOSABLE: Disposable = { dispose: () => {} }
   /* A SET, NOT A SLOT, since phase 18.
    *
    * It was `exclusiveSlot` — "the service host is already bound" — which was
@@ -645,12 +694,6 @@ export function createKernelServices({
   const shelfSlot = exclusiveSlot<ShelfPort | null>('bindShelfPort: the shelf port is already bound', null)
   const sizeSlot = exclusiveSlot<SizePort | null>('bindSizePort: the size port is already bound', null)
   const hashSlot = exclusiveSlot<HashPort | null>('bindHashPort: the hash port is already bound', null)
-  /* The two provider ports (WI-15.4, WI-15.13). Held from birth for the same
-   * reason the recorder is: a capability implementing one can only arrive
-   * after construction, and the holders must not have to know that. */
-  const companionSlot = exclusiveSlot<CompanionProvider>('bindCompanion: the companion port is already bound', NOT_CONFIGURED)
-  const glossSlot = exclusiveSlot<GlossProvider>('bindGloss: the gloss port is already bound', NO_GLOSS)
-  const workLineSlot = exclusiveSlot<WorkLine>('bindWorkLine: the work line port is already bound', NO_WORK_LINE)
 
   const writes = writeQueue()
   const library = createLibrary({ fs, queue: writes, initial: initialBooks, recorder: recorderPort, clock: clockPort, hashes: () => hashSlot.get() })
@@ -692,10 +735,16 @@ export function createKernelServices({
       /* The property is read INSIDE the guard: a getter that throws is a
          failure of this host, not a reason to leave the hosts after it
          undisposed. */
+      /* ⚠️ **NOTHING TO DISPOSE IS NOT A FAILURE, AND TWO DIRECTIVES HERE SAID IT
+         COULD NOT HAPPEN.** They claimed an undefined host threw and was recorded
+         "the same outcome", and that a host with no disposer was refused before
+         this ran. Both are false on the unwinds: a host that REJECTED is an
+         `undefined` in the list, and the host being refused for answering no
+         disposer is in the list that unwind disposes. Skipping them is what
+         keeps them out of the dispose-failure report — which the report's tests
+         now read. */
       try {
-        // Stryker disable next-line OptionalChaining: an undefined host throws inside this try and is recorded as a failure — the same outcome, by the guard below.
         const dispose = one?.dispose
-        // Stryker disable next-line ConditionalExpression: a host with no disposer was refused before this runs, so nothing this skips is ever present.
         if (typeof dispose !== 'function') continue
         dispose.call(one)
       } catch (cause) {
@@ -731,9 +780,9 @@ export function createKernelServices({
     shelfRead: () => shelfRead,
     fs,
     storage,
-    removeBlob: (bookId, name) => removeBlob({ fs, library, recorder: recorderPort }, bookId, name),
+    removeBlob: (bookId, name) => removeBlob({ library, recorder: recorderPort }, bookId, name),
     bindRecorder: (next) => recorderSlot.bind(next),
-    bindClock: (next) => clockSlot.bind(next),
+    bindClock: (next, witness) => clockSlot.bind({ now: next, witness }),
     clock: clockPort,
     bindServiceHost: (next) => {
       /* A fresh object per bind — see the Set's own note. Two binds of one
@@ -742,12 +791,13 @@ export function createKernelServices({
       const binding = { host: next }
       serviceHosts.add(binding)
       /* Idempotent, like every other disposer here: a capability whose teardown
-       * runs twice must not remove a host a later composition bound. */
-      let disposed = false
+       * runs twice must not remove a host a later composition bound. The
+       * binding's own identity is what makes it so — a second delete of this
+       * object finds nothing, and a later bind of the same function is a
+       * different object. (A `disposed` flag stood here as well, and changed
+       * nothing a second call could do.) */
       return {
         dispose: () => {
-          if (disposed) return
-          disposed = true
           serviceHosts.delete(binding)
         },
       }
@@ -760,19 +810,12 @@ export function createKernelServices({
     sizes: () => sizeSlot.get(),
     bindHashPort: (next) => hashSlot.bind(next),
     hashes: () => hashSlot.get(),
-    bindCompanion: (next) => companionSlot.bind(next),
-    /* Resolved per call, never captured: a pane that read the provider once
-     * at mount would still be showing "no model configured" after the reader
-     * installed one. */
-    companion: () => companionSlot.get(),
-    bindGloss: (next) => glossSlot.bind(next),
-    gloss: () => glossSlot.get(),
-    bindWorkLine: (next) => workLineSlot.bind(next),
-    workLine: () => workLineSlot.get(),
     serveServices: async (list) => {
       /* NO HOST IS THE OFFLINE CASE, not a failure — see `bindServiceHost`.
-       * With none bound there is nothing to serve and nothing to dispose. */
-      if (serviceHosts.size === 0) return NOOP_DISPOSABLE
+       * With none bound there is nothing to serve and nothing to dispose: an
+       * empty set settles to an empty list, which refuses nothing, and whose
+       * disposer disposes and reports nothing. (It returned a shared no-op
+       * disposer early, which answered exactly that by a second route.) */
 
       /* EVERY host gets the same list. They are transports, and a service
        * reachable over one wire and not another would be a difference nothing
@@ -786,9 +829,12 @@ export function createKernelServices({
        * could not see. `allSettled` keeps them all, so the unwind can be
        * complete whichever way a host failed. */
       const settled = await Promise.allSettled([...serviceHosts].map(async ({ host }) => await host(list)))
-      const served = settled.map((one) => (one.status === 'fulfilled' ? one.value : undefined))
-      const thrown = settled.find((one) => one.status === 'rejected')
-      if (thrown !== undefined && thrown.status === 'rejected') {
+      /* A REJECTED RESULT CARRIES NO `value`, so reading it answers `undefined`
+         — a host that did not serve, which the unwind skips. Asked of the status
+         first, the answer was the same either way. */
+      const served = settled.map((one) => (one as { readonly value?: Disposable }).value)
+      const thrown = settled.find((one): one is PromiseRejectedResult => one.status === 'rejected')
+      if (thrown !== undefined) {
         /* THE ORIGINAL FAILURE WINS. A disposer throwing during the unwind is
          * worth reporting and must not replace the reason we are unwinding. */
         reportDisposeFailures('serve-rejected', disposeAll(served as (Disposable | undefined)[]))
@@ -809,16 +855,20 @@ export function createKernelServices({
       /* The READ is guarded as well: `dispose` could be a getter, and a
          getter that throws escaped this line before `disposeAll` ran, leaking
          every host that had answered properly. */
-      /* Stryker disable BlockStatement: an empty block answers undefined, which refuses the host the same way. */
+      /* ⚠️ THE DIRECTIVE HERE COVERED ALL THREE BLOCKS AND WAS TRUE OF ONE. An
+         empty CATCH answers undefined and refuses the host the same way; an
+         empty function or an empty TRY refuses every host, which the serving
+         cases see at once. Narrowed to the catch. */
       const hasDisposer = (one: unknown): boolean => {
         try {
           // Stryker disable next-line OptionalChaining: an undefined host throws inside this try and is refused the same way.
           return typeof (one as Disposable | undefined)?.dispose === 'function'
-        } catch {
+        }
+        // Stryker disable next-line BlockStatement: an empty catch answers undefined, which refuses the host the same way.
+        catch {
           return false
         }
       }
-      /* Stryker restore BlockStatement */
       const bad = served.findIndex((one) => !hasDisposer(one))
       if (bad !== -1) {
         reportDisposeFailures('serve-no-disposer', disposeAll(served as (Disposable | undefined)[]))
@@ -828,8 +878,10 @@ export function createKernelServices({
       /* ONCE, HOWEVER OFTEN IT IS CALLED. `Disposable` says disposal is
        * idempotent and this ran every child again on a second call — so a
        * caller that disposed defensively (a teardown path and an unmount, say)
-       * double-disposed every host beneath it. The children are not required to
-       * tolerate that, and the contract does not ask them to. */
+       * double-disposed every host beneath it. The same contract DOES require
+       * each host's own disposer to tolerate a second call — but a host is
+       * exactly the code this port cannot vouch for, and one flag here means no
+       * host is ever asked to prove it. */
       let disposed = false
       return {
         dispose: () => {
@@ -848,10 +900,41 @@ export function createKernelServices({
       /* THE INDEX FIRST (phase 20, D4): a page turn writes `book.json` and
        * leaves the index dirty behind a throttle, and a drain is the one
        * moment — quit, window close — that must not wait for the timer. The
-       * flush queues the rewrite; the idle below is what waits for it. */
-      await library.flushIndex()
-      await writes.idle()
-      await storage?.flush?.()
+       * flush queues the rewrite; the idle below is what waits for it.
+       *
+       * ⚠️ **AND THE INDEX AGAIN, AFTER THE IDLE.** A tick still ON the queue
+       * marks the index dirty only when its record lands, which is after the
+       * first flush has already found nothing to do — so the drain resolved
+       * with `index.dirty` on disk and the promised flush not made. The marker
+       * kept recovery safe; the second flush is what makes the drain true.
+       *
+       * ⚠️ **EVERY STAGE IS ATTEMPTED, WHATEVER AN EARLIER ONE DID.** These were
+       * bare awaits in a row, so an index write that rejected skipped the idle
+       * and the flat store's flush — a failure in the shelf's cache abandoning
+       * settings and cards that had nothing to do with it, at the one moment
+       * nothing can be retried. `shutdown.ts` fixed the same shape one level up.
+       * The failures are raised once everything has been tried: one as itself,
+       * several as one `AggregateError` whose message names each. */
+      const failures: unknown[] = []
+      const stage = async (run: () => unknown): Promise<void> => {
+        try {
+          await run()
+        } catch (cause) {
+          failures.push(cause)
+        }
+      }
+      await stage(() => library.flushIndex())
+      await stage(() => writes.idle())
+      await stage(() => library.flushIndex())
+      await stage(() => writes.idle())
+      await stage(() => storage?.flush?.())
+      /* SEVERAL ASKED FIRST. Asked second, `> 1` was reached only by a count
+         that was not one, where `>= 1` answered the same — a bound no count
+         could tell apart from its neighbour. */
+      if (failures.length > 1) {
+        throw new AggregateError(failures, `drain: ${failures.length} stages failed — ${failures.map(messageOf).join('; ')}`)
+      }
+      if (failures.length === 1) throw failures[0]
     },
   }
 }

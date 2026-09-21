@@ -35,6 +35,18 @@ export async function detectBookExtension(file: File): Promise<KnownExtension | 
 /** Upper bound for each file read and native write, including retry paths. */
 export const IMPORT_CHUNK_BYTES = 256 * 1024
 
+/* One process owns the data root, but two callers can still import the same
+ * book concurrently (two picker events, or a test/automation beside the UI).
+ * A fixed `<target>.writing` lets those calls append into and rename each
+ * other's temporary file. The suffix makes the staging file private to this
+ * attempt; the library lock handles the separate-process case. */
+let importAttempt = 0
+
+function importWritingPath(targetPath: string): string {
+  importAttempt += 1
+  return `${targetPath}.writing.${importAttempt}`
+}
+
 /** Write bounded chunks, then publish the completed file with one rename. */
 export async function writeBookContentSafely(
   fs: VaultFs,
@@ -44,9 +56,10 @@ export async function writeBookContentSafely(
   if (file.size > IMPORT_CHUNK_BYTES && !fs.appendFile) {
     throw new Error('Device storage does not support importing large files in chunks.')
   }
-  const writingPath = `${targetPath}.writing`
+  const writingPath = importWritingPath(targetPath)
   const cut = targetPath.lastIndexOf('/')
-  if (cut > 0) await fs.mkdir(targetPath.slice(0, cut))
+  const parent = cut > 0 ? targetPath.slice(0, cut) : null
+  if (parent !== null) await fs.mkdir(parent)
   try {
     // Truncate a partial previous attempt, even when the new file is empty.
     await fs.writeFile(writingPath, new Uint8Array())
@@ -55,7 +68,13 @@ export async function writeBookContentSafely(
       if (offset === 0) await fs.writeFile(writingPath, bytes)
       else await fs.appendFile!(writingPath, bytes)
     }
+    /* Appends are not covered by `writeAtomic`: make every chunk durable
+     * before publishing the completed file, then make the rename durable.
+     * A filesystem without fsync is a test/browser fallback; both native
+     * adapters implement it. */
+    await fs.fsync?.(writingPath, 'full')
     await fs.rename(writingPath, targetPath)
+    if (parent !== null) await fs.fsync?.(parent, 'full')
   } catch (cause) {
     await fs.remove(writingPath).catch(() => {})
     throw cause
@@ -116,4 +135,3 @@ export async function importMobileBook(services: KernelServices, file: File): Pr
   console.log('[Carta:import] complete:', bookId)
   return bookId
 }
-

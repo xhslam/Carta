@@ -342,44 +342,6 @@ export const NOOP_DIAGNOSTICS: Diagnostics = {
 }
 
 /* ------------------------------------------------------------------------ */
-/* WorkLine                                                                  */
-/* ------------------------------------------------------------------------ */
-
-/**
- * ONE LINE saying what a capability is doing that the reader asked for.
- *
- * The library's status bar has a single work slot and a strict priority
- * ladder — the reader's own import first, then the app's background parse —
- * and `Library.tsx` is emphatic that the two "cannot be shown at once and
- * they must not be given a second line: a status bar that grows is a status
- * bar that moves the shelf". This port is how a capability reaches that slot
- * without the kernel importing it.
- *
- * WHAT BELONGS HERE, and the test is the import line's own stated grounds:
- * the reader asked for it, it reports a count, **and it stops**. A model
- * download qualifies. A standing "AI is ready" does not — readiness is not
- * work, it would be the first thing ever to hold that slot at rest, and it
- * would have to outrank an import the reader just asked for.
- *
- * A STRING, not a count pair: the bar draws a fact and does not compute one,
- * which is the same rule that keeps a progress bar out of the settings pane.
- * `null` means nothing is happening, and at rest the bar is byte-for-byte
- * what it was before any of this existed.
- */
-export interface WorkLine {
-  /** The line to show, or null. */
-  line(): string | null
-  /** `useSyncExternalStore`'s half — called when the line may have changed. */
-  subscribe(listener: () => void): () => void
-}
-
-/** The default: nothing is ever doing anything, and nothing ever notifies. */
-export const NO_WORK_LINE: WorkLine = {
-  line: () => null,
-  subscribe: () => () => {},
-}
-
-/* ------------------------------------------------------------------------ */
 /* SettingsStore                                                             */
 /* ------------------------------------------------------------------------ */
 
@@ -419,7 +381,28 @@ export function defineSetting<T>(
   if (dot < 1 || dot === key.length - 1) {
     throw new Error(`defineSetting: ${JSON.stringify(key)} must be "<namespace>.<name>", both non-empty`)
   }
-  return { key, fallback, parse }
+  return { key, fallback: frozen(fallback), parse: (raw) => frozen(parse(raw)) }
+}
+
+/**
+ * A value and everything reachable through its own properties, frozen in place.
+ *
+ * ⚠️ **A SETTING'S VALUE WAS SHARED, AND MUTABLE.** A fallback is one object every
+ * store and every reader is handed, and a parser may pass a stored value straight
+ * through — so a reader who changed what `get` returned changed it for every
+ * other reader, with no notification, no write, and the snapshot's identity
+ * unchanged (2026-09-13 verify). Frozen where every setting is minted, the
+ * mutation fails at the line that makes it, whichever store reads the setting.
+ *
+ * The walk carries what it has seen, so a cycle ends it, and a parent somebody
+ * already froze does not hide a child that was not.
+ */
+export function frozen<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
+  if (typeof value !== 'object' || value === null || seen.has(value)) return value
+  seen.add(value)
+  Object.freeze(value)
+  for (const child of Object.values(value)) frozen(child, seen)
+  return value
 }
 
 /**
@@ -434,6 +417,8 @@ export function defineSetting<T>(
  */
 export interface SettingsStore {
   get<T>(setting: Setting<T>): T
+  /** Whether this setting has an explicit stored value rather than its fallback. */
+  has<T>(setting: Setting<T>): boolean
   /**
    * Write a preference. **NEVER THROWS**, and it used to.
    *

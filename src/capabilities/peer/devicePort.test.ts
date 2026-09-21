@@ -254,6 +254,54 @@ describe('readRole', () => {
     expect(await readRole({ localRole: async () => 'shelf' }, () => false, quiet)).toBe('shelf')
   })
 
+  /**
+   * ⚠️ **AND EVERY CAPABILITY HAS TO ASK THROUGH IT, WHICH `sync` DID NOT.**
+   * The retry above existed, was tested, and `sync/index.ts` still called
+   * `port.localRole()` once and turned any failure into `'shelf'` — as the
+   * FIRST caller after the plugin registers, which is the likeliest moment to
+   * meet the transient this whole function is for. One late answer bound a
+   * satchel as a shelf for the session: no scheduler, no Download or Evict,
+   * `idle` status, and nothing to retry because nothing had failed.
+   *
+   * Written over the SOURCE rather than as a behavioural case because there is
+   * no capability-level harness that starts `sync` against a fake port, and a
+   * rule about "which function every caller must use" is a fact about the tree
+   * either way. `readRole`'s own definition is the single exception.
+   */
+  it('is the only way any capability reads the role — nothing calls localRole() directly', async () => {
+    const { readFileSync, readdirSync } = await import('node:fs')
+    const { join, sep } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    /* ⚠️ **A FILE URL'S `pathname` IS NOT A PATH ON WINDOWS** (2026-09-14). It
+       is `/C:/Users/…`, which `join` turned into `C:\C:\Users\…`, and the walk
+       died on ENOENT the first time the Windows leg reached it. The filters
+       below spell paths with `/`, and Windows separates with `\`, so every
+       path is compared in forward slashes. */
+    const root = fileURLToPath(new URL('../../../src/capabilities/', import.meta.url))
+    const posix = (file: string): string => file.split(sep).join('/')
+    const walk = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+        const at = join(dir, entry.name)
+        if (entry.isDirectory()) return walk(at)
+        return /\.tsx?$/.test(entry.name) && !/\.test\.|\.testkit\./.test(entry.name) ? [at] : []
+      })
+    const files = walk(root)
+    /* NON-VACUOUS: a walk that found nothing would pass in silence. */
+    expect(files.length).toBeGreaterThan(30)
+
+    const offenders = files
+      .filter((file) => !posix(file).endsWith('/peer/index.ts'))
+      .filter((file) => !posix(file).includes('/peer/lib/'))
+      .filter((file) => {
+        /* Comments stripped, or this test's own explanation of the defect —
+           and the one in `sync/index.ts` — would count as a call. */
+        const text = readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ')
+        return /\blocalRole\s*\(\s*\)/.test(text)
+      })
+      .map((file) => posix(file.slice(root.length)))
+    expect(offenders).toEqual([])
+  })
+
   it('retries a plugin that is not ready yet, rather than concluding satchel', async () => {
     vi.useFakeTimers()
     try {

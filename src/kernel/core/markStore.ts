@@ -1,4 +1,5 @@
 import { canonicalJson } from './canonicalJson'
+import { notifyAll } from './notify'
 import { folderOf, marksPathIn, readMarks, trashOf, writeMarks } from './bookFolder'
 import type { ResolvedCfi } from './resolvedCfi'
 import { scanAllMarks, type IndexFs } from './bookIndex'
@@ -477,17 +478,11 @@ export function createMarkStore({
       unreadable: openId !== null && unreadableId === openId,
       scanFailed,
     }
-    for (const listener of [...listeners]) {
-      /* EACH ON ITS OWN. One throwing subscriber used to stop every later
-       * one — and, called from the optimistic half of `applyTo`, stopped the
-       * disk write behind it; called after a successful write, its throw was
-       * then classified as a persistence failure by the catch around it. */
-      try {
-        listener()
-      } catch (cause) {
-        console.error('Carta: a marks subscriber threw', cause)
-      }
-    }
+    /* EACH ON ITS OWN. One throwing subscriber used to stop every later
+     * one — and, called from the optimistic half of `applyTo`, stopped the
+     * disk write behind it; called after a successful write, its throw was
+     * then classified as a persistence failure by the catch around it. */
+    notifyAll(listeners, 'marks')
   }
 
   /**
@@ -931,6 +926,13 @@ export function createMarkStore({
       if (!rewrote && fresh.length === 0) return prev
       return [...mine, ...fresh]
     }, undefined, prepare)
+    /* `applyTo` replaces the target slice but preserves other book ids; drop
+     * the superseded source rows once their rewritten copies are published. */
+    const without = all.filter((mark) => mark.bookId !== from)
+    if (without.length !== all.length) {
+      all = without
+      publish()
+    }
   }
 
   const mergeRemote: MarkStore['mergeRemote'] = (bookId, incoming) => {

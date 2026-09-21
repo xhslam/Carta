@@ -32,3 +32,6 @@ export { BOOKS_ONLY_BYTES, LIBRARY_FIXTURE, LIBRARY_FIXTURE_BYTES } from './core
    says why this is not a second production minting site, and names the
    boundary rule that keeps it from becoming one. */
 export { resolvedCfiForTesting } from './core/resolvedCfi.testkit'
+
+/** The error a promise rejected with, preserving the rejected value for assertions. */
+export { refusalOf } from './core/refusal.testkit'

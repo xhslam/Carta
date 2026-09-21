@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { MUTATION_KINDS, SERVICE_TABLE, readingGrant, type MutationKind, type MutationToken } from '../kernel'
+import { MUTATION_KINDS, SERVICE_TABLE, messageOf, readingGrant, type MutationKind, type MutationToken } from '../kernel'
 import { FIXTURE_FILES } from '../hosts/node/fixture.testkit'
 import { IDENTITY_TOLERANCE_MS, LOCK_FILE, LockHeld, acquireDataLock, hostBootedAt, ownStartedAt } from '../hosts/node/lock'
 import { openNodeServices, type NodeHost } from '../hosts/node/services'
@@ -44,10 +44,22 @@ async function library(): Promise<string> {
 }
 
 afterEach(async () => {
-  while (hosts.length > 0) await hosts.pop()?.close()
-  while (roots.length > 0) {
-    const root = roots.pop()
-    if (root) await rm(root, { recursive: true, force: true })
+  /* The roots go whatever a close does: a close that threw ended this hook
+     before the removal, so the library waited for a later case with nothing
+     to close — and stayed for good when none came. */
+  try {
+    while (hosts.length > 0) await hosts.pop()?.close()
+  } finally {
+    while (roots.length > 0) {
+      const root = roots.pop()
+      if (!root) continue
+      try {
+        await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 })
+      } catch (cause) {
+        const left = await readdir(root, { recursive: true }).catch(() => ['<unreadable>'])
+        throw new Error(`the scratch library would not go: ${messageOf(cause)} — left behind: ${left.join(', ')}`)
+      }
+    }
   }
 })
 

@@ -132,6 +132,8 @@ const KERNEL_BROWSER_ENTRY = '^src/kernel/ui/browser\\.ts$'
  *  `ReadingStyle` and the rest. ZERO dependencies of its own, which is the test
  *  every leaf on this list passes. */
 const KERNEL_UI_TYPES = '^src/kernel/core/uiTypes\\.ts$'
+/** Shared localisation primitives are a browser-safe leaf used by both mobile shells. */
+const KERNEL_I18N = '^src/kernel/ui/i18n\\.tsx$'
 
 /** The BROWSER CLIENT: `src/app/web/`, the SPA the shelf serves to a phone.
  *
@@ -576,6 +578,7 @@ module.exports = {
           KERNEL_STYLESHEETS,
           KERNEL_METRICS,
           KERNEL_UI_TYPES,
+          KERNEL_I18N,
           KERNEL_MOBILE_ENTRY,
         ],
       },
@@ -600,6 +603,7 @@ module.exports = {
           KERNEL_STYLESHEETS,
           KERNEL_METRICS,
           KERNEL_UI_TYPES,
+          KERNEL_I18N,
           KERNEL_OVERLAY_SHEET,
           KERNEL_BOOK_COVER,
           KERNEL_COVER_ART,

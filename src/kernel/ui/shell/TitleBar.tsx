@@ -7,9 +7,7 @@ import {
   Minus,
   PanelLeft,
   PanelRight,
-  Puzzle,
   Search,
-  Sparkles,
   Square,
   Type,
   X,
@@ -20,6 +18,8 @@ import type { Platform } from '../../core/metrics'
 import { inTauri } from '../inTauri'
 import { PANE_TITLES, comboFor } from '../panes'
 import type { ContributedScreenId } from '../../core/uiTypes'
+import type { ContributionIcon } from '../../core/capability'
+import { CONTRIBUTION_ICONS } from '../contributionIcon'
 import type { AppDispatch, AppState, KernelPaneId } from '../state'
 import type { Speech } from '../reader/useSpeech'
 import styles from './TitleBar.module.css'
@@ -31,15 +31,25 @@ const LIGHTS = ['var(--tl-red)', 'var(--tl-amber)', 'var(--tl-green)'] as const
  * Shortcuts into the pane. They used to toggle a separate 340px card; now they
  * open the pane on that panel, and clicking the active one closes it.
  *
- * Two panels of the eight, chosen here — but their LABELS come from the shared
+ * A few panels of the rail, chosen here — but their LABELS come from the shared
  * registry, not from a third copy of them. The name is `TITLEBAR_PANES` rather
  * than `PANE_SHORTCUTS`, which is what this was called: that name already
  * means §11's ⌘1…5 map in `ui/panes`, and two different things under one name
  * in one codebase is a trap for whoever greps for it next.
+ *
+ * ⚠️ **FILTERED THROUGH `paneFits`, WHICH THIS WAS THE ONE SURFACE NOT TO DO.**
+ * It drew the deleted companion's button for every reader, although the rail,
+ * the palette and the digit accelerators all refused the panel — so the click
+ * was redirected to Contents by `paneFor`. It could never light, so a second
+ * press re-opened Contents rather than closing it, and the control named one
+ * destination while performing another.
+ *
+ * That also falsifies what `UNFINISHED_PANE_IDS` says about itself — "the only
+ * edit required" to ship a panel — for as long as a surface reads the list
+ * without reading the rule. Everything here asks the rule.
  */
 const TITLEBAR_PANES: readonly { key: KernelPaneId; Icon: typeof ListTree }[] = [
   { key: 'toc', Icon: ListTree },
-  { key: 'companion', Icon: Sparkles },
 ]
 
 export interface TitleBarProps {
@@ -61,7 +71,12 @@ export interface TitleBarProps {
    * would forget — leaving a reader in a room with no door. The kernel offers
    * the switch, so a screen cannot be entered without a way out of it.
    */
-  screens?: readonly { readonly id: ContributedScreenId; readonly label: string }[]
+  screens?: readonly {
+    readonly id: ContributedScreenId
+    readonly label: string
+    /** What to draw for it — see `CONTRIBUTION_ICONS`. */
+    readonly icon: ContributionIcon
+  }[]
 }
 
 /**
@@ -232,7 +247,13 @@ export function TitleBar({
                 data-on={state.screen === one.id}
                 onClick={() => dispatch({ type: 'goScreen', screen: one.id })}
               >
-                <Puzzle size={ICON.control} strokeWidth={ICON.stroke} />
+                {/* THE SCREEN'S OWN GLYPH. Every contributed screen drew a
+                    puzzle piece — see `CONTRIBUTION_ICONS` for what that
+                    cost the rail, which had the same defect. */}
+                {(() => {
+                  const Icon = CONTRIBUTION_ICONS[one.icon]
+                  return <Icon size={ICON.control} strokeWidth={ICON.stroke} />
+                })()}
               </button>
             ))}
           </div>

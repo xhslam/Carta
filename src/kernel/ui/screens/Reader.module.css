@@ -1,10 +1,10 @@
 /* The reader.
  *
- * §03: gutter 56 / measure 660 / margin 250, gap 32. With the companion column
- * open the measure narrows to 620 and the gutter to 40, the margin collapses,
- * and the gap closes to 22. The gutter and margin are HOST columns — companion
- * marks and the ruler hint live there, outside the text, which is why they are
- * grid tracks rather than padding on the book.
+ * §03: gutter 56 / measure 660 / margin 250, gap 32. With the side pane open
+ * the measure narrows to 620 and the gutter to 40, the margin collapses, and
+ * the gap closes to 22. The gutter and margin are HOST columns — margin notes
+ * and the ruler hint live there, outside the text, which is why they are grid
+ * tracks rather than padding on the book.
  */
 
 .reader {
@@ -674,10 +674,10 @@
 }
 
 .emptyTitle {
-  font-family: 'Crimson Pro Variable', 'Crimson Pro', Georgia, serif;
+  font-family: var(--font-serif);
   font-size: var(--text-display);
   font-weight: var(--weight-regular);
-  line-height: 1.1;
+  line-height: var(--leading-display);
   letter-spacing: var(--track-tight);
   color: var(--ink);
   margin: 0;
@@ -687,7 +687,7 @@
   max-width: var(--prose-wide);
   margin: 0;
   font-size: var(--text-body);
-  line-height: 1.6;
+  line-height: var(--leading-body);
   color: var(--muted);
   text-wrap: pretty;
 }
@@ -724,7 +724,7 @@
   border: 1px solid var(--amber-line);
   color: var(--amber);
   font-size: var(--text-ui);
-  line-height: 1.6;
+  line-height: var(--leading-body);
   text-align: start;
 }
 

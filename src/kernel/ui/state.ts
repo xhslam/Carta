@@ -78,6 +78,7 @@ export type {
  * is passed as is; the reducer reads nothing else off it.
  */
 export type ContributedPanes = readonly Pick<PaneContribution, 'id' | 'screens'>[]
+// Stryker disable next-line ArrayDeclaration: every reader of the list asks `entry.id === pane` first, and a string entry has no `id`, so a list holding one fits exactly the panels an empty list fits
 const NO_CONTRIBUTED: ContributedPanes = []
 
 export interface AppState {
@@ -178,9 +179,10 @@ export interface AppState {
    * values, so a mark made by keyboard and a mark made by pointer cannot come
    * out looking different.
    *
-   * Not persisted across launches — like `theme`, `stepIdx` and every other
-   * reading setting here, which is a gap this state has had all along rather
-   * than one these two fields introduce.
+   * PERSISTED across launches, like `theme`, `stepIdx` and every other reading
+   * setting here — `KERNEL_SETTINGS.markTint` and `.markStyle`. This said "not
+   * persisted", describing a gap the settings store has since closed, until
+   * the 2026-09-13 audit.
    */
   readonly markTint: MarkTint
   readonly markStyle: MarkStyle
@@ -312,13 +314,25 @@ export type Action =
  * a clamp without the finite check let NaN straight through to the lookup.
  */
 /**
+ * The fields of `ReadingStyle` whose value is a number — which is to say, an
+ * index. Derived from the type, so the table below has to name every one.
+ */
+type ScaledReadingStyleKey = { [K in ReadingStyleKey]: ReadingStyle[K] extends number ? K : never }[ReadingStyleKey]
+
+/**
  * Which of `ReadingStyle`'s fifteen are INDICES into a scale.
  *
  * A table rather than a condition in the reducer, so adding a scaled setting is
  * one line here and forgetting to clamp it is not possible in the other
  * direction — an unlisted key is a closed set the compiler already checked.
+ *
+ * ⚠️ **AND FORGETTING ONE HERE WAS POSSIBLE UNTIL THE 2026-09-13 AUDIT.** The
+ * table was a `Partial<Record<…>>`, so a numeric field left out of it compiled,
+ * took the reducer's `scale === undefined` branch and was stored unclamped —
+ * the trap the table exists to close. Keyed by `ScaledReadingStyleKey`, an
+ * omission is a compile error.
  */
-const READING_STYLE_SCALES: Partial<Record<ReadingStyleKey, SpacingScale>> = {
+const READING_STYLE_SCALES: Readonly<Record<ScaledReadingStyleKey, SpacingScale>> = {
   figureWidth: FIGURE_WIDTHS,
   figureHeight: FIGURE_HEIGHTS,
   minimumSize: MINIMUM_SIZES,
@@ -327,6 +341,22 @@ const READING_STYLE_SCALES: Partial<Record<ReadingStyleKey, SpacingScale>> = {
 function scaleIndex(idx: number, length: number): number | null {
   if (!Number.isFinite(idx)) return null
   return Math.min(Math.max(Math.round(idx), 0), length - 1)
+}
+
+/**
+ * `brightness` or `contrast` at an index into its own scale — the same state
+ * when the index has not moved or is not a number.
+ *
+ * ⚠️ **ONE CASE EACH, NAMING ITS OWN PAIR, AND IT WAS ONE CASE FOR BOTH.** The
+ * shared branch picked the key and then the scale by testing `action.type`
+ * twice, and `BRIGHTNESS` and `CONTRAST` are both five steps — so the second
+ * test decided nothing a behaviour could see, and all four of its mutants
+ * survived every test (2026-09-15 mutation sweep). Named at the case, the
+ * pairing is read off one line rather than decided by a branch.
+ */
+function atIndex(state: AppState, key: 'brightness' | 'contrast', scale: SpacingScale, idx: number): AppState {
+  const at = scaleIndex(idx, scale.steps.length)
+  return at === null || state[key] === at ? state : { ...state, [key]: at }
 }
 
 /**
@@ -394,11 +424,18 @@ export function reducer(state: AppState, action: Action, contributed: Contribute
       return {
         ...state,
         pane: paneFor(state.screen, action.pane, audienceOf(state, contributed)),
-        lastPane: action.pane,
+        lastPane: paneOffered(action.pane, state.developer, state.hiddenPanes) ? action.pane : state.lastPane,
         paletteOpen: false,
       }
 
+    /* ⚠️ **NOT WHERE THERE IS NO PANE — see `paneAvailable`.** The titlebar and
+     * ⌘\ both refused on a contributed screen and the palette's "Close the side
+     * pane" did not, so it closed a pane nothing was drawing and the reader came
+     * back to the shelf with the panel they had left open gone. Refused HERE,
+     * where every dispatcher arrives, with `lastPane` untouched, so leaving the
+     * screen restores what was open before they came (2026-09-13 audit). */
     case 'togglePane':
+      if (!paneAvailable(state.screen)) return state
       return state.pane
         ? { ...state, pane: null }
         : { ...state, pane: paneFor(state.screen, state.lastPane, audienceOf(state, contributed)) }
@@ -415,7 +452,13 @@ export function reducer(state: AppState, action: Action, contributed: Contribute
     case 'toggleDeveloper':
       return afterVisibilityChange({ ...state, developer: !state.developer }, contributed)
 
+    /* THE SAME STATE WHEN THE LIST ALREADY SAYS SO. A hide of a panel already
+       hidden built a new array, and the write effect depends on `hiddenPanes`
+       by IDENTITY, on the promise — stated at `useAppState` — that it changes
+       only when the list does; so each repeat re-ran the whole preference
+       write (2026-09-13 audit). */
     case 'setPaneHidden':
+      if (state.hiddenPanes.includes(action.pane) === action.hidden) return state
       return afterVisibilityChange(
         {
           ...state,
@@ -502,7 +545,11 @@ export function reducer(state: AppState, action: Action, contributed: Contribute
      * for an unchanged setting would re-run it on every dispatch.
      */
     case 'setReadingStyle': {
-      const scale = READING_STYLE_SCALES[action.key]
+      /* Widened to every key for the lookup, by assignment rather than a cast:
+         the table is complete for the scaled keys, and a key it does not name
+         is one of the closed sets. */
+      const scales: Partial<Record<ReadingStyleKey, SpacingScale>> = READING_STYLE_SCALES
+      const scale = scales[action.key]
       const value =
         scale === undefined ? action.value : scaleIndex(action.value as number, scale.steps.length)
       if (value === null || state.readingStyle[action.key] === value) return state
@@ -510,12 +557,10 @@ export function reducer(state: AppState, action: Action, contributed: Contribute
     }
 
     case 'setBrightness':
-    case 'setContrast': {
-      const key = action.type === 'setBrightness' ? 'brightness' : 'contrast'
-      const scale = action.type === 'setBrightness' ? BRIGHTNESS : CONTRAST
-      const idx = scaleIndex(action.idx, scale.steps.length)
-      return idx === null || state[key] === idx ? state : { ...state, [key]: idx }
-    }
+      return atIndex(state, 'brightness', BRIGHTNESS, action.idx)
+
+    case 'setContrast':
+      return atIndex(state, 'contrast', CONTRAST, action.idx)
 
     case 'setAlign':
       return state.align === action.align ? state : { ...state, align: action.align }
@@ -551,22 +596,44 @@ export function reducer(state: AppState, action: Action, contributed: Contribute
 export type AppDispatch = Dispatch<Action>
 
 /**
+ * The two arguments of a reading-style change, CORRELATED — one member per
+ * setting, each holding that setting's own key beside its own value type.
+ *
+ * ⚠️ **IT WAS `<K extends ReadingStyleKey>(key: K, value: ReadingStyle[K])`, AND
+ * A GENERIC DOES NOT MAKE `K` A SINGLE KEY.** Instantiated with a union —
+ * `setReadingStyle<'separation' | 'figureFrame'>('separation', 'shadow')` —
+ * `ReadingStyle[K]` was both value types at once, the call compiled, and the
+ * reducer stored a separation of `'shadow'`: the compile error the signature
+ * promised, not given. No caller did it, and the type is what has to refuse it.
+ *
+ * A UNION OF TUPLES CANNOT BE INSTANTIATED THAT WAY: there is no member pairing
+ * one setting's key with another's value, so the pairing above is not a type
+ * the union contains. TypeScript resolves an ordinary call against the member
+ * whose key it was given, so every real call site reads exactly as before.
+ *
+ * ⚠️ **AND IT HAS TO BE SPELLED ON `onStyle` TOO** (`pane/Settings.tsx`), which
+ * had the identical generic: closing it here alone would have moved the hole
+ * one call up rather than shut it (2026-09-13 audit, #212).
+ */
+export type ReadingStyleArgs = {
+  [K in ReadingStyleKey]: [key: K, value: ReadingStyle[K]]
+}[ReadingStyleKey]
+
+/**
  * A `setReadingStyle` action, with the key and the value checked against each
  * other.
  *
  * THE CAST IS HERE AND NOWHERE ELSE, and it is a limit of the type system
  * rather than a shortcut. `Action` distributes over the fifteen keys so the
  * REDUCER can narrow `value` from `key` — which is the property worth having,
- * because it is what makes a `separation` of `'shadow'` a compile error. What
- * TypeScript cannot then prove is that a `{ key: K; value: ReadingStyle[K] }`
- * built from a generic `K` is one of those fifteen members, though it is one by
- * construction. Every call site stays type-checked; this one function absorbs
- * the gap, with the assertion written down.
+ * because it is what makes a `separation` of `'shadow'` a compile error.
+ * Destructuring the tuple above is what loses the correlation again: `key` and
+ * `value` become the two unions, and TypeScript cannot then prove the pair it
+ * just took apart is one of the fifteen members. The ARGUMENTS are checked at
+ * every call site; this one function absorbs the gap, with the assertion
+ * written down.
  */
-export function setReadingStyle<K extends ReadingStyleKey>(
-  key: K,
-  value: ReadingStyle[K],
-): Action {
+export function setReadingStyle(...[key, value]: ReadingStyleArgs): Action {
   return { type: 'setReadingStyle', key, value } as Action
 }
 
@@ -584,11 +651,10 @@ export function setReadingStyle<K extends ReadingStyleKey>(
  * The panels that have nothing to show without an open book.
  *
  * Not a style question, and not a list anyone should keep a second copy of.
- * `Contents` lists the open book's own table of contents, `Companion` says as
- * much in its own subtitle — "grounded in this book only" — and `Search` takes
- * a `Book` and scans it. On the library screen all three are a title above an
- * apology, and the pane OPENED ONTO ONE OF THEM: the first thing Carta showed a
- * reader with a full shelf was a panel saying it was not available.
+ * `Contents` lists the open book's own table of contents and `Search` takes a
+ * `Book` and scans it. On the library screen both are a title above an apology,
+ * and the pane OPENED ONTO ONE OF THEM: the first thing Carta showed a reader
+ * with a full shelf was a panel saying it was not available.
  *
  * Marginalia and Cards are deliberately absent. Both are cross-book by design —
  * Marginalia shows every book's marks, notes and places — and they are why the
@@ -599,7 +665,7 @@ export function setReadingStyle<K extends ReadingStyleKey>(
  * It lives here rather than in the pane registry because the ids are declared
  * here and the reducer below needs the same answer. The registry reads it.
  */
-const BOOK_ONLY: readonly PaneId[] = ['toc', 'search', 'companion']
+const BOOK_ONLY: readonly PaneId[] = ['toc', 'search']
 
 /**
  * The panels that mean something only on the SHELF.
@@ -629,10 +695,24 @@ export interface PaneAudience {
   readonly hiddenPanes?: readonly string[]
 }
 
+/**
+ * Whether ONE contribution belongs on this screen — the rule `paneFits` applies
+ * to a contributed id, for a caller that already holds the contribution.
+ *
+ * The rail had the same question and no way to ask it: it filtered the
+ * contributed list through `paneFits`, which looks each id up in that list
+ * again, so a rail of n contributed panes rescanned the list n times (#148).
+ * The cost is nothing at today's two, and the rule being in two places is not
+ * nothing — the rail would have been the copy that forgot `screens`.
+ */
+export function contributionFits(screen: Screen, entry: ContributedPanes[number]): boolean {
+  return entry.screens.includes(screen)
+}
+
 export function paneFits(screen: Screen, pane: PaneId, audience: PaneAudience = {}): boolean {
   const contributed = audience.contributed ?? NO_CONTRIBUTED
   if (isContributedPaneId(pane)) {
-    return contributed.some((entry) => entry.id === pane && entry.screens.includes(screen))
+    return contributed.some((entry) => entry.id === pane && contributionFits(screen, entry))
   }
   /* ⚠️ **NO KERNEL PANEL FITS A CONTRIBUTED SCREEN, and that is what makes a
    * screen a screen.** The rail below is panels about a book or about the
@@ -649,7 +729,10 @@ export function paneFits(screen: Screen, pane: PaneId, audience: PaneAudience = 
    * own fallback), and §11's pane ids drifted across exactly three copies
    * before `panes.ts` existed. A sixth caller gets the whole rule or none of
    * it. */
-  if (!paneOffered(pane, audience.developer ?? false, audience.hiddenPanes ?? [])) return false
+  /* `hiddenPanes` WITH NO FALLBACK OF ITS OWN: `paneOffered` defaults an absent
+     list to none, and a second `?? []` here was a default nothing could tell
+     from its mutant — the list is consulted only for an unfinished id. */
+  if (!paneOffered(pane, audience.developer ?? false, audience.hiddenPanes)) return false
   return screen === 'reader' ? !SHELF_ONLY.includes(pane) : !BOOK_ONLY.includes(pane)
 }
 
@@ -666,8 +749,10 @@ export function defaultPaneFor(screen: Screen): PaneId {
   /* A contributed screen has no panel to fall back to — `paneFits` refuses
      every one of them. The answer is never read (the side pane is closed on
      such a screen); returning the shelf's panel keeps the type honest without
-     inventing a state. */
-  if (isContributedScreenId(screen)) return 'library'
+     inventing a state. It is not the reader, so the `return` below already
+     answers `library` for it — which is why the branch that said so again is
+     gone: it returned what falling through returns, and no behaviour could
+     tell it was there (2026-09-15 mutation sweep). */
   /* ⚠️ **CONTENTS, AND IT USED TO BE COMPANION.** The reader's fallback panel
    * cannot be one that most readers are not shown: `companion` is in
    * `UNFINISHED_PANE_IDS`, so with developer options off it fits nowhere, and a
@@ -784,12 +869,13 @@ export function screenFor(search: string): Screen {
 /**
  * The application state, with the durable half remembered.
  *
- * READ BEFORE THE FIRST RENDER, written on change. The fifteen preferences
- * that survive a launch — theme, face, size, spacing, alignment, brightness,
- * contrast, layout, side, the three edge marks and the mark's own tint and
- * style — live in `AppState` while the app runs, because that is what every
- * control reads and every reducer case writes; the `SettingsStore` is where
- * they go between launches. `bootState` folds the stored values in, and the
+ * READ BEFORE THE FIRST RENDER, written on change. The preferences that survive
+ * a launch — every entry in `KERNEL_SETTINGS` — live in `AppState` while the
+ * app runs, because that is what every control reads and every reducer case
+ * writes; the `SettingsStore` is where they go between launches. This said
+ * "the fifteen" and listed them until the 2026-09-13 audit, long after there
+ * were more: the table is the list, and a count here only goes stale.
+ * `bootState` folds the stored values in, and the
  * effect below writes each change back. `set` on the store is by value, so a
  * re-render that changes nothing durable writes nothing.
  *
@@ -804,11 +890,19 @@ export function useAppState(settings: SettingsStore, contributed: ContributedPan
    * for the app's lifetime, so this is built once. React reads the reducer
    * from the latest render either way. */
   const reduce = useCallback((state: AppState, action: Action) => reducer(state, action, contributed), [contributed])
-  const [state, dispatch] = useReducer(
-    reduce,
+  /* ⚠️ **LAZILY, THROUGH `useReducer`'S THIRD ARGUMENT.** The initial state was
+   * an ordinary argument, so `bootState` — and `readKernelPreferences`, a read
+   * and a parse per preference — ran on EVERY render and was thrown away on all
+   * but the first: a keystroke in the shelf's search re-read the whole settings
+   * store (2026-09-13 audit). An initializer runs once, which is the only time
+   * the value was ever used. */
+  const [state, dispatch] = useReducer(reduce, settings, (store) =>
     bootState(
-      typeof window === 'undefined' ? '' : window.location.search,
-      readKernelPreferences(settings),
+      typeof window === 'undefined'
+        ? // Stryker disable next-line StringLiteral: `screenFor` reads only a `book` parameter, and neither an empty search nor "Stryker was here!" has one — both open the library
+          ''
+        : window.location.search,
+      readKernelPreferences(store),
       contributed,
     ),
   )
@@ -831,8 +925,8 @@ export function useAppState(settings: SettingsStore, contributed: ContributedPan
     }
     /* SPREAD FIELD BY FIELD, not `[settings, prefs]`: `preferencesOf` builds a
      * fresh object every render, so depending on it would run this effect on
-     * every page turn and keystroke. `spacing` is the one nested value, so its
-     * four indices are listed rather than the object that holds them. */
+     * every page turn and keystroke. `spacing`'s four indices are listed where
+     * the object itself would do as well — see the note at `readingStyle`. */
   }, [
     settings,
     /* ⚠️ **OMITTED AT FIRST, EXACTLY AS THE FIFTEEN BELOW WERE.** This effect
@@ -843,8 +937,10 @@ export function useAppState(settings: SettingsStore, contributed: ContributedPan
        ⌘⌃⌥D worked and did not survive a relaunch.
 
        `hiddenPanes` is safe as an identity: `setPaneHidden` builds a new array
-       only when the list actually changes, so this cannot re-run on a page turn
-       the way a freshly-built `spacing` wrapper would. */
+       only when the list actually changes, so this cannot re-run on a page
+       turn. (That promise was false for a repeated hide or show until the
+       2026-09-13 audit, which also struck a comparison here to a
+       "freshly-built `spacing` wrapper" that does not exist.) */
     prefs.developer,
     prefs.hiddenPanes,
     prefs.theme,
@@ -865,13 +961,17 @@ export function useAppState(settings: SettingsStore, contributed: ContributedPan
     prefs.progressLineOn,
     prefs.markTint,
     prefs.markStyle,
-    /* THE OBJECT, not its fifteen fields — and unlike `spacing` above, that is
-       safe here. `setReadingStyle` returns the SAME object when a setting has
-       not moved, so its identity is stable across a page turn or a keystroke;
-       `spacing` is listed field by field because `preferencesOf` builds a fresh
-       wrapper each render and its own reducer branch predates that guarantee.
-       Omitted entirely at first, which meant fifteen settings a reader could
-       move and never save — the effect simply never re-ran. */
+    /* THE OBJECT, not its fifteen fields, and that is safe: `setReadingStyle`
+       returns the SAME object when a setting has not moved, so its identity is
+       stable across a page turn or a keystroke. Omitted entirely at first,
+       which meant fifteen settings a reader could move and never save — the
+       effect simply never re-ran.
+
+       `spacing` WOULD BE EXACTLY AS SAFE. This note said it is listed field by
+       field because `preferencesOf` builds a fresh wrapper each render — it
+       passes `state.spacing` through by reference, and `setSpacing` keeps the
+       object when an index has not moved. The indices stay listed, which is
+       harmless; the reason given was false (2026-09-13 audit). */
     prefs.readingStyle,
   ])
   return [state, dispatch]
@@ -924,12 +1024,15 @@ export function bootState(
   contributed: ContributedPanes = NO_CONTRIBUTED,
 ): AppState {
   const screen = screenFor(search)
-  /* CLOSED STAYS CLOSED, FITTED STAYS FITTED — and the two must not tangle.
-   * The old conditional fed the FALLBACK into `paneFits` and then returned the
-   * original: with a null initial pane, "the default fits" answered yes and
-   * null came back — which happened to be wanted, by an accident of routing
-   * rather than a statement of it. Said directly: a null seed boots closed;
-   * anything else boots to that panel where it fits, or the screen's default. */
+  /* THE SEED'S PANEL, FITTED: where it fits, or the screen's default.
+   *
+   * ⚠️ **THIS BRANCHED ON A NULL SEED, WHICH CANNOT HAPPEN.** An older
+   * conditional fed the fallback into `paneFits` and returned the original, and
+   * the repair said directly that "a null seed boots closed" — but
+   * `initialState` is a readonly constant whose `pane` is `'library'`, so that
+   * branch and the `lastPane` fallback beside it were code no launch could
+   * reach (2026-09-13 audit). Booting closed would need the seed as a
+   * parameter, and nothing asks for one. */
   /* THE PREFERENCES GO ON FIRST, then the things a launch decides. Screen and
      pane are session facts and are not persisted — see `KERNEL_SETTINGS` — so a
      stored file cannot put the reader back into a panel they closed, and the
@@ -939,12 +1042,13 @@ export function bootState(
      that is a stored preference. Choosing the pane first asked the question
      with the answer still on disk. */
   const prefs = { ...preferencesOf(initialState), ...remembered }
+  // Stryker disable next-line ObjectLiteral: the seed's panel is `library`, which `paneOffered` never refuses and no contributed pane can stand in for — so it fits the library and not the reader for every audience, and `{}` fits it identically
   const audience = {
     contributed,
     developer: prefs.developer,
     hiddenPanes: prefs.hiddenPanes,
   }
-  const pane = initialState.pane === null ? null : paneFor(screen, initialState.pane, audience)
+  const pane = paneFor(screen, initialState.pane, audience)
   /* THE SAME RULE THE REDUCER KEEPS: paginated flow has no ruler (§06). Two
    * stored values can disagree — the layout written after the ruler — and a
    * launch must not start in a state no sequence of actions can reach. */
@@ -965,7 +1069,7 @@ export function bootState(
     rulerOn,
     screen,
     pane,
-    lastPane: pane ?? initialState.lastPane,
+    lastPane: pane,
   }
 }
 
@@ -978,4 +1082,25 @@ export function bootState(
  */
 export function hasOpenLayer(state: AppState): boolean {
   return LAYER_ORDER.some((layer) => state[layer])
+}
+
+/**
+ * Whether the BOOK has the reader's input — the one question every paging
+ * route asks, however the reader asked to turn the page.
+ *
+ * ⚠️ **IT WAS ASSEMBLED TWICE AND THE TWO COPIES DID NOT AGREE** (2026-09-13
+ * audit, #207). `Reader.onPageIntent` guards the wheel and the swipe on three
+ * things — the reader's screen, no open layer, and the side pane not being a
+ * SHEET over the book — while `App`'s key handler guarded the arrow keys on the
+ * first two only. So below §06's threshold, where the pane stops being a track
+ * beside the book and becomes a sheet over it, a wheel gesture was refused and
+ * an arrow key turned the page underneath the sheet.
+ *
+ * `paneIsTrack` is the caller's, because the two know it differently: the
+ * reader measures the window it is laying out, and App reads it at the moment
+ * of the keystroke. It is only consulted when a pane is OPEN — a closed pane
+ * covers nothing whatever the window is doing.
+ */
+export function readerTakesInput(state: AppState, paneIsTrack: boolean): boolean {
+  return state.screen === 'reader' && !hasOpenLayer(state) && (state.pane === null || paneIsTrack)
 }

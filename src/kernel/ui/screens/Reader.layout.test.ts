@@ -17,10 +17,11 @@ import { describe, expect, it } from 'vitest'
  * cheapest durable check on the property itself, and it fails with the reason
  * attached rather than leaving the next person to rediscover it in the browser.
  */
-const css = readFileSync(
-  fileURLToPath(new URL('./Reader.module.css', import.meta.url)),
-  'utf8',
-)
+/** A stylesheet's text, by its path from this file. */
+const sheet = (path: string): string =>
+  readFileSync(fileURLToPath(new URL(path, import.meta.url)), 'utf8')
+
+const css = sheet('./Reader.module.css')
 
 /**
  * One rule's body, comments removed.
@@ -74,112 +75,31 @@ describe('the prose bleed', () => {
   })
 })
 
-const glossCss = readFileSync(
-  fileURLToPath(new URL('../reader/GlossStrip.module.css', import.meta.url)),
-  'utf8',
-)
-
-const tokensCss = readFileSync(
-  fileURLToPath(new URL('../styles/tokens.css', import.meta.url)),
-  'utf8',
-)
+const popupCss = sheet('../reader/SelectionTools.module.css')
 
 /**
- * Every opacity a rule sets, as a NUMBER, whether it was written as a literal
- * or as a token.
+ * ⚠️ **THIS FILE ALSO HELD WI-16.3's CSS HALF, AND THAT SURFACE IS GONE.**
+ * The deleted lookup face drew a language model's definition in the selection
+ * popup, and about two hundred lines here read `LookUpFace.module.css`: that an
+ * apology is never amber, that a part of speech is not hidden by a stylesheet,
+ * that a long failure wraps rather than being clipped. The face, its stylesheet
+ * and every assertion over it went with the AI features.
  *
- * ⚠️ **IT USED TO MATCH `[\d.]+` AND ONLY THAT.** When `.glossFailedReason`'s
- * `0.75` became `var(--opacity-quiet)` the pattern found nothing, and the
- * non-vacuity assertion below — the one that exists so a loop over no
- * declarations cannot pass — went red. That was the guard working: the check is
- * "is this element visible", and an assertion that can only read literals stops
- * asking it the moment the design system is used properly.
- *
- * Following the token is also STRONGER. A literal `opacity: 0` was catchable
- * before; a token defined as `0` was not, because there was no literal to read.
- * Now both are.
+ * What survives is the rule that was never the lookup's, though it lived under
+ * its heading until 2026-09-14 (#159): the popup scrolls inside the room it is
+ * placed in, whichever face it shows.
  */
-function opacitiesOf(selector: string): number[] {
-  const out: number[] = []
-  for (const [, raw] of glossRule(selector).matchAll(/opacity\s*:\s*([^;]+)/g)) {
-    const value = (raw ?? '').trim()
-    const token = /^var\(\s*(--[\w-]+)\s*\)$/.exec(value)
-    if (!token) {
-      out.push(Number(value))
-      continue
-    }
-    const defined = new RegExp(`${token[1]}\\s*:\\s*([\\d.]+)`).exec(tokensCss)
-    if (!defined) throw new Error(`tokens.css defines no ${token[1]}`)
-    out.push(Number(defined[1]))
-  }
-  return out
-}
-
-/** The same scoping as `ruleBody`, over the strip's own stylesheet. */
-function glossRule(selector: string): string {
-  const source = glossCss.replace(/\/\*[\s\S]*?\*\//g, '')
-  const match = new RegExp(`\\${selector}\\s*\\{([^}]*)\\}`).exec(source)
-  if (!match) throw new Error(`GlossStrip.module.css has no rule for ${selector}`)
-  return match[1] ?? ''
-}
-
-/**
- * WI-16.3's CSS half, and ONLY that half.
- *
- * The behaviour — which element each state renders into, whether the failure is
- * visible, whether it says "couldn't" — is asserted by RENDERING, in
- * `reader/GlossStrip.test.tsx`. It used to be asserted here by scanning
- * `Reader.tsx`'s source, and an audit named what that misses: adding `hidden`
- * to the failed element leaves every source assertion green while the failure
- * disappears from the screen.
- *
- * What stays here is the one question a rendering test cannot answer. CSS
- * Modules give jsdom a hashed class name and no stylesheet, so "is it amber" is
- * legible only from the stylesheet — and amber is the whole point:
- * `core/gloss.ts` says an apology must never be resolved as a definition
- * "because an apology rendered in amber reads as a definition".
- */
-describe('the gloss that did not arrive', () => {
-  it('is not amber, while the definition still is', () => {
-    // Non-vacuity first: amber is the point of the definition box, and a test
-    // that only asserted the absence would pass if both lost their colour.
-    expect(glossRule('.gloss')).toMatch(/var\(--amber/)
-    expect(glossRule('.glossTerm')).toMatch(/var\(--amber/)
-    expect(glossRule('.glossFailed')).not.toMatch(/var\(--amber/)
-    expect(glossRule('.glossFailedReason')).not.toMatch(/var\(--amber/)
-  })
-
-  /*
-   * THE OTHER HALF OF "drawn apart": it has to be drawn.
-   *
-   * `GlossStrip.test.tsx` catches a `hidden` attribute, and cannot catch this —
-   * CSS Modules give jsdom a hashed class name and no stylesheet, so a rule
-   * that hid the element would leave every mounted case green while the reader
-   * saw nothing. A verification pass named exactly that mutation. This is the
-   * only place it is visible.
-   */
-  it('is drawn at all — not hidden by its own rule', () => {
-    for (const rule of ['.glossFailed', '.glossFailedSaid', '.glossFailedReason']) {
-      expect(glossRule(rule)).not.toMatch(/display\s*:\s*none/)
-      expect(glossRule(rule)).not.toMatch(/visibility\s*:\s*(hidden|collapse)/)
-      expect(glossRule(rule)).not.toMatch(/content-visibility\s*:\s*hidden/)
-      /* Opacity is READ rather than pattern-matched, because the pattern that
-       * looks right is wrong: `/opacity:\s*0(\D|$)/` matches `opacity: 0.75`,
-       * since `.` is a non-digit. The question is numeric, so ask it that way —
-       * through the token, which `opacitiesOf` resolves. */
-      for (const value of opacitiesOf(rule)) {
-        expect(value).toBeGreaterThan(0)
-      }
-    }
-    /* Non-vacuity: the reason IS de-emphasised, so a loop over no declarations
-     * at all would pass. There is one to find. */
-    expect(opacitiesOf('.glossFailedReason')).toHaveLength(1)
-  })
-
-  /* A phrase lookup can be 120 characters (`isLookUpTerm`), and at
-   * `flex: 0 0 auto` a failed one pushed the dismiss control off the line. */
-  it('lets a long term shrink rather than pushing the control off the line', () => {
-    expect(glossRule('.glossFailedSaid')).toMatch(/flex:\s*0\s+1\s+auto/)
-    expect(glossRule('.glossFailedSaid')).toMatch(/min-width:\s*0/)
+describe('the selection popup’s own room', () => {
+  /* `SelectionTools` bounds EVERY face by the room it is placed in, because
+     placement can move a surface and cannot shrink one — so the popup has to
+     scroll within that bound, or the bound only clips what it holds.
+     ON THE POPUP ITSELF, AND IT READ ONE FACE'S RULE until the rows were
+     bounded too — a scroll that only one face had would have clipped the
+     others. `auto` in both directions: a row overflows sideways. */
+  it('scrolls any face larger than its room, rather than clipping it', () => {
+    const source = popupCss.replace(/\/\*[\s\S]*?\*\//g, '')
+    const match = /\.popup\s*\{([^}]*)\}/.exec(source)
+    if (!match) throw new Error('SelectionTools.module.css has no rule for .popup')
+    expect(match[1]).toMatch(/(^|;|\s)overflow\s*:\s*auto/)
   })
 })

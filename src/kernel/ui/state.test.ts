@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest'
 import { DEFAULT_STEP_IDX, READING_STEPS, readingStep } from '../core/metrics'
 import { BUNDLED_FACES, faceById } from '../core/typefaces'
 import { createSettingsStore, readKernelPreferences } from '../core/settings'
-import { bootState, defaultPaneFor, initialState, paneFits, preferencesOf, reducer, screenFor, type AppState } from './state'
+import { bootState, contributionFits, defaultPaneFor, initialState, paneFits, preferencesOf, readerTakesInput, reducer, screenFor, type AppState } from './state'
 import { paneOffered } from '../core/uiTypes'
 
 /**
@@ -127,7 +127,7 @@ describe('toggleProgressLine', () => {
  */
 describe('the scroll port hooks match the fork', () => {
   const paginator = readFileSync(
-    fileURLToPath(new URL('../../../node_modules/foliate-js/paginator.js', import.meta.url)),
+    fileURLToPath(import.meta.resolve('foliate-js/paginator.js')),
     'utf8',
   )
   const reader = readFileSync(
@@ -184,7 +184,7 @@ describe('the scroll port hooks match the fork', () => {
 describe('every offered typeface is a font that exists', () => {
   const read = (path: string) =>
     readFileSync(fileURLToPath(new URL(path, import.meta.url)), 'utf8')
-  const main = read('../../main.tsx')
+  const main = read('../../main.mobile.tsx')
 
   /* Crimson Pro is still BUNDLED and no longer OFFERED: the interface sets its
    * empty states and note bodies in it, so the webfont must stay, while as a
@@ -295,12 +295,12 @@ describe('the pane follows the screen', () => {
      * show, so the panel could only ever say 'open a book first'. Notes
      * browses every book's marks, which is why it stays.
      *
-     * ⚠️ `companion` AND `cards` NOW NEED A SECOND THING as well as a book —
-     * they are unfinished, so they need a reader who asked to see them. The
-     * screen rule below is asked with developer options ON, which is the only
-     * state in which the screen rule is the one that decides. */
+     * ⚠️ `cards` NEEDS A SECOND THING as well as a book — it is unfinished, so
+     * it needs a reader who asked to see it. The screen rule below is asked
+     * with developer options ON, which is the only state in which the screen
+     * rule is the one that decides. */
     const dev = { developer: true }
-    for (const pane of ['toc', 'search', 'companion'] as const) {
+    for (const pane of ['toc', 'search'] as const) {
       expect(paneFits('reader', pane, dev)).toBe(true)
       expect(paneFits('library', pane, dev)).toBe(false)
     }
@@ -308,6 +308,32 @@ describe('the pane follows the screen', () => {
     for (const pane of ['marginalia', 'cards', 'library', 'settings'] as const) {
       expect(paneFits('library', pane, dev)).toBe(true)
     }
+  })
+
+  /* ONE ANSWER TO "DOES THE BOOK HAVE THE READER'S INPUT", for the wheel and
+     the keyboard alike — they were assembled separately and the keyboard's
+     copy forgot the sheet (#207). Each clause is asked on its own. */
+  it('gives the book the reader’s input only on the reader, under no layer, with no sheet over it', () => {
+    const reading: AppState = { ...initialState, screen: 'reader', pane: null }
+    expect(readerTakesInput(reading, false)).toBe(true)
+    expect(readerTakesInput({ ...reading, screen: 'library' }, true)).toBe(false)
+    expect(readerTakesInput({ ...reading, paletteOpen: true }, true)).toBe(false)
+    /* The pane counts only while it is open, and only as a sheet. */
+    expect(readerTakesInput({ ...reading, pane: 'toc' }, false)).toBe(false)
+    expect(readerTakesInput({ ...reading, pane: 'toc' }, true)).toBe(true)
+  })
+
+  /* ONE RULE FOR A CONTRIBUTED PANEL, asked two ways: by id, which looks the
+     contribution up, and of the contribution itself, which is what the rail
+     already holds (#148). They must not be able to disagree. */
+  it('answers the same for a contribution held as for its id', () => {
+    const circle = { id: 'circle:book', screens: ['reader'] } as const
+    const audience = { contributed: [circle] }
+    for (const screen of ['reader', 'library'] as const) {
+      expect(contributionFits(screen, circle)).toBe(paneFits(screen, circle.id, audience))
+    }
+    expect(contributionFits('reader', circle)).toBe(true)
+    expect(contributionFits('library', circle)).toBe(false)
   })
 
   /* The mirror: the collection view is about the SHELF, and in the reader the
@@ -332,30 +358,29 @@ describe('the pane follows the screen', () => {
    */
   describe('the unfinished panels', () => {
     it('fit nowhere until developer options are on', () => {
-      for (const pane of ['companion', 'cards'] as const) {
-        expect(paneFits('reader', pane)).toBe(false)
-        expect(paneFits('library', pane)).toBe(false)
-      }
+      expect(paneFits('reader', 'cards')).toBe(false)
+      expect(paneFits('library', 'cards')).toBe(false)
     })
 
     it('fit their own screens once they are', () => {
-      expect(paneFits('reader', 'companion', { developer: true })).toBe(true)
       expect(paneFits('reader', 'cards', { developer: true })).toBe(true)
       expect(paneFits('library', 'cards', { developer: true })).toBe(true)
     })
 
     /* THE SCREEN RULE STILL APPLIES. Developer options reveal a panel; they do
-       not put a book-only panel on the shelf. */
+       not put a book-only panel on the shelf. Asked on a FINISHED book-only
+       panel, because the list of unfinished ones no longer holds one — which is
+       the point: the two rules are independent, and this is the half that says
+       so. */
     it('still obey the screen they belong to', () => {
-      expect(paneFits('library', 'companion', { developer: true })).toBe(false)
+      expect(paneFits('library', 'toc', { developer: true })).toBe(false)
     })
 
     /* Hiding one is only meaningful under developer options, and turning the
        master switch off gives the plain app back whatever was ticked. */
     it('can be hidden individually while developer options are on', () => {
-      const hidden = { developer: true, hiddenPanes: ['cards'] }
-      expect(paneFits('reader', 'cards', hidden)).toBe(false)
-      expect(paneFits('reader', 'companion', hidden)).toBe(true)
+      expect(paneFits('reader', 'cards', { developer: true, hiddenPanes: ['cards'] })).toBe(false)
+      expect(paneFits('reader', 'cards', { developer: true, hiddenPanes: ['dev'] })).toBe(true)
     })
 
     /* The Developer panel is the mirror image: it exists only under the switch,
@@ -398,9 +423,45 @@ describe('the pane follows the screen', () => {
        something the reader is no longer offered. */
     it('do not leave an unreachable panel remembered', () => {
       const on = reducer(at({ screen: 'reader' }), { type: 'toggleDeveloper' })
-      const opened = reducer(on, { type: 'openPane', pane: 'companion' })
+      const opened = reducer(on, { type: 'openPane', pane: 'cards' })
       const off = reducer(opened, { type: 'toggleDeveloper' })
       expect(off.lastPane).toBe('toc')
+    })
+
+    /**
+     * ⚠️ **`openPane` WROTE STRAIGHT THROUGH THE INVARIANT THE TEST ABOVE
+     * MEASURES.** `afterVisibilityChange` repairs `lastPane` when developer
+     * options change, and it was the only thing enforcing "the remembered
+     * panel is one this reader may see". `openPane` recorded whatever it was
+     * asked for — so a request for an unfinished panel opened the screen's
+     * default and remembered the unopenable id, and nothing repaired it until
+     * the next visibility change, which for a reader who never touches the
+     * chord never comes.
+     *
+     * The cost is the panel the reader actually had: `togglePane` resolves the
+     * unopenable id to the screen default a second time, so Marginalia is gone
+     * after one press of a control that could not do anything in the first
+     * place.
+     */
+    it('an unofferable request leaves the remembered panel alone rather than overwriting it', () => {
+      const reading = at({ screen: 'reader', pane: 'marginalia', lastPane: 'marginalia' })
+      /* The click the titlebar used to offer every reader. */
+      const asked = reducer(reading, { type: 'openPane', pane: 'cards' })
+      expect(asked.pane).toBe('toc') // the request cannot be honoured...
+      expect(asked.lastPane).toBe('marginalia') // ...and must not cost the memory
+
+      const shut = reducer(asked, { type: 'closePane' })
+      expect(reducer(shut, { type: 'togglePane' }).pane).toBe('marginalia')
+    })
+
+    /* The same action with a panel the reader IS offered still records it —
+       the guard is about offered-ness, not about refusing to remember. */
+    it('an offerable request is remembered as before', () => {
+      const reading = at({ screen: 'reader', pane: 'toc', lastPane: 'toc' })
+      expect(reducer(reading, { type: 'openPane', pane: 'marginalia' }).lastPane).toBe('marginalia')
+      /* And under the chord, so is an unfinished one — it is offered then. */
+      const on = reducer(at({ screen: 'reader' }), { type: 'toggleDeveloper' })
+      expect(reducer(on, { type: 'openPane', pane: 'cards' }).lastPane).toBe('cards')
     })
 
     it('hide and show one panel at a time', () => {
@@ -408,7 +469,9 @@ describe('the pane follows the screen', () => {
       const hidden = reducer(on, { type: 'setPaneHidden', pane: 'cards', hidden: true })
       expect(hidden.hiddenPanes).toEqual(['cards'])
       expect(paneFits('reader', 'cards', hidden)).toBe(false)
-      expect(paneFits('reader', 'companion', hidden)).toBe(true)
+      /* AND ONLY THE ONE NAMED. Developer is not unfinished, so hiding Cards
+         must leave it exactly where it was. */
+      expect(paneFits('reader', 'dev', hidden)).toBe(true)
 
       const shown = reducer(hidden, { type: 'setPaneHidden', pane: 'cards', hidden: false })
       expect(shown.hiddenPanes).toEqual([])
@@ -452,6 +515,16 @@ describe('the pane follows the screen', () => {
       const twice = reducer(once, { type: 'setPaneHidden', pane: 'cards', hidden: true })
       expect(twice.hiddenPanes).toEqual(['cards'])
     })
+
+    /* THE SAME STATE, not an equal one. The write effect depends on
+       `hiddenPanes` by identity, so a repeat that rebuilt the array re-ran the
+       whole preference write (2026-09-13 audit). */
+    it('return the same state when the list already says so', () => {
+      const on = reducer(at({ screen: 'reader' }), { type: 'toggleDeveloper' })
+      const once = reducer(on, { type: 'setPaneHidden', pane: 'cards', hidden: true })
+      expect(reducer(once, { type: 'setPaneHidden', pane: 'cards', hidden: true })).toBe(once)
+      expect(reducer(on, { type: 'setPaneHidden', pane: 'cards', hidden: false })).toBe(on)
+    })
   })
 
   /**
@@ -482,7 +555,6 @@ describe('the pane follows the screen', () => {
   /* NON-VACUITY: the check must be able to fail. An unfinished panel is exactly
      what it is guarding against, so it has to answer false for one. */
   it('would notice a default that is not offered', () => {
-    expect(paneOffered('companion', false)).toBe(false)
     expect(paneOffered('cards', false)).toBe(false)
   })
 
@@ -497,7 +569,7 @@ describe('the pane follows the screen', () => {
   })
 
   it('moves off a book-only panel on the way to the library', () => {
-    const next = reducer(at({ screen: 'reader', pane: 'companion' }), {
+    const next = reducer(at({ screen: 'reader', pane: 'toc' }), {
       type: 'goScreen',
       screen: 'library',
     })
@@ -541,12 +613,12 @@ describe('the pane follows the screen', () => {
    * open", and asking it about a null pane opened one on every screen change —
    * the same conflation as a pane that shuts itself, from the other side. */
   it('does not open a pane the reader had closed', () => {
-    const shut = at({ screen: 'reader', pane: null, lastPane: 'companion' })
+    const shut = at({ screen: 'reader', pane: null, lastPane: 'toc' })
     expect(reducer(shut, { type: 'goScreen', screen: 'library' }).pane).toBeNull()
   })
 
   it('reopens a fitting panel when the toggle is used on the library', () => {
-    const shut = at({ screen: 'library', pane: null, lastPane: 'companion' })
+    const shut = at({ screen: 'library', pane: null, lastPane: 'toc' })
     expect(reducer(shut, { type: 'togglePane' }).pane).toBe('library')
   })
 
@@ -634,7 +706,9 @@ describe('the hook starts from bootState', () => {
      * so the pin is two facts rather than one spelling: the wrapper delegates
      * to `reducer`, and the initial state is `bootState(`. */
     expect(hook).toMatch(/const reduce = useCallback\(\(state: AppState, action: Action\) => reducer\(state, action, contributed\)/)
-    expect(hook).toMatch(/useReducer\(\s*reduce,\s*bootState\(/)
+    /* LAZILY: the store is the initializer's argument, so the preferences are
+       read once and not on every render (2026-09-13 audit). */
+    expect(hook).toMatch(/useReducer\(\s*reduce,\s*settings,\s*\(store\) =>\s*bootState\(/)
   })
 
   /* And it reads the settings store into that call — the whole point of the
@@ -642,7 +716,7 @@ describe('the hook starts from bootState', () => {
   it('hands the remembered preferences to bootState', () => {
     const source = readFileSync(fileURLToPath(new URL('./state.ts', import.meta.url)), 'utf8')
     const hook = source.slice(source.indexOf('export function useAppState'))
-    expect(hook).toMatch(/bootState\([^)]*readKernelPreferences\(settings\)/)
+    expect(hook).toMatch(/bootState\([^)]*readKernelPreferences\(store\)/)
     expect(hook).toMatch(/writeKernelPreferences\(settings, prefs\)/)
   })
 })
@@ -721,6 +795,8 @@ describe('bootState with remembered preferences', () => {
         minimumSize: 2,
         fidelity: 'publisher' as const,
       },
+      /* WI-17.5, and NOT the default `reader`, for the reason the fifteen above
+         give. */
     }
     expect(preferencesOf(bootState('', remembered))).toEqual(remembered)
   })
@@ -906,6 +982,18 @@ describe('a contributed screen owns the whole window (WI-22.D3)', () => {
     expect(isContributedScreenId('circle:circle')).toBe(true)
     expect(isContributedScreenId('library')).toBe(false)
     expect(isContributedScreenId('reader')).toBe(false)
+  })
+
+  /* ⚠️ **AND THE PANE TOGGLE IS REFUSED ON ONE**, not merely undrawn. The
+     palette's "Close the side pane" reached the reducer there and closed a pane
+     nothing was drawing, so the panel left open on the shelf was gone on the way
+     back (2026-09-13 audit). */
+  it('refuses the pane toggle on one, and gives the shelf its open panel back', () => {
+    const shelf: AppState = { ...initialState, screen: 'library', pane: 'marginalia', lastPane: 'marginalia' }
+    const away = reducer(shelf, { type: 'goScreen', screen: 'circle:circle' })
+    const toggled = reducer(away, { type: 'togglePane' })
+    expect(toggled).toBe(away)
+    expect(reducer(toggled, { type: 'goScreen', screen: 'library' }).pane).toBe('marginalia')
   })
 
   it('offers a contributed pane only on a screen it named', () => {

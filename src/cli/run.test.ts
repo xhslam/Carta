@@ -36,10 +36,16 @@ async function library(): Promise<string> {
 }
 
 afterEach(async () => {
-  while (hosts.length > 0) await hosts.pop()?.close()
-  while (roots.length > 0) {
-    const root = roots.pop()
-    if (root) await rm(root, { recursive: true, force: true })
+  /* The roots go whatever a close does: a close that threw ended this hook
+     before the removal, so the library waited for a later case with nothing
+     to close — and stayed for good when none came. */
+  try {
+    while (hosts.length > 0) await hosts.pop()?.close()
+  } finally {
+    while (roots.length > 0) {
+      const root = roots.pop()
+      if (root) await rm(root, { recursive: true, force: true })
+    }
   }
 })
 
@@ -309,7 +315,7 @@ describe('what an audit of the CLI found', () => {
     const root = await library()
     const bad = await cli(root, ['mark', 'add', 'aaa', 'epubcfi(/6/4)', 'x', '--kind', 'nonsense'])
     expect(bad.code).toBe(EXIT.usage)
-    expect(bad.err).toContain('must be one of highlight, companion, bookmark')
+    expect(bad.err).toContain('must be one of highlight, bookmark')
   })
 
   /* A title, an author and a note are all strings SOMEBODY ELSE WROTE. A

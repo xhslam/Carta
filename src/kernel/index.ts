@@ -1,11 +1,31 @@
 /**
- * The kernel's public entry — the ONLY kernel module anything outside
- * `src/kernel/` may import (`.dependency-cruiser.cjs`, rule
- * `kernel-public-entry-only`), with the exemptions that rule names: the
- * browser client under `src/app/web/` reaches `ui/browser` and `core/metrics`
- * directly, because this barrel re-exports modules that import `@tauri-apps`
- * and a web bundle may carry none of them. Those exemptions are written
- * beside the rule, with the reason; they are not a licence for anyone else.
+ * The kernel's public entry — the only kernel module a capability, or anything
+ * else under `src/` outside the kernel, may import (`.dependency-cruiser.cjs`,
+ * rule `kernel-public-entry-only`).
+ *
+ * The shells and the composition roots are not exemptions from that rule. It
+ * leaves them out of its `from` entirely, and each is judged by a rule of its
+ * own that names its kernel doors exactly: `composition-root-kernel-entries`,
+ * `web-client-kernel-entries`, `mobile-client-kernel-entries` and
+ * `shared-shell-kernel-entries`. The browser client's, for one, admits this
+ * entry, `ui/browser`, and five browser-safe leaves. Read the lists in the
+ * rules — they are what a build enforces, and a copy of one here is how this
+ * header came to be wrong.
+ *
+ * ⚠️ **THIS HEADER CALLED THEM "THE EXEMPTIONS THAT RULE NAMES", AND GAVE THE
+ * BROWSER TWO MODULES.** Both were stale: the exemption was replaced by the
+ * separate rules, and the browser's door lists seven. Found by audit.
+ *
+ * ⚠️ **THE REASON ONCE GIVEN FOR THE SEPARATE DOORS WAS THAT THIS BARREL PULLS
+ * IN `@tauri-apps`, AND IT DOES NOT.** `pnpm browser:check` holds this exact
+ * module and passes: every platform binding was split out of the kernel
+ * (`vaultFsTauri.ts` from `bookVault.ts` is the pattern), which is what made
+ * the kernel reachable from a browser at all. What the doors are really for is
+ * WEIGHT and REACT: a barrel's re-exports evaluate with the barrel, so a web
+ * bundle that wanted two surfaces would load every one of them, and
+ * `ui/browser` is the entry that grows one export at a time for that reason. A
+ * rationale that names a blocker which no longer exists is one somebody will
+ * remove the door over. Found by audit.
  *
  * NOTHING REACT. What is here is the non-React kernel: the services a
  * composition root builds and a capability's `start` receives, the ports a
@@ -21,6 +41,27 @@
  * that reaches into a capability cannot cross this line unnoticed. (That scan
  * is textual and reads doc comments too — which is why nothing here spells
  * the forbidden path.)
+ *
+ * ⚠️ **AN EXPORT NOBODY IMPORTS COSTS A MODULE LOAD ONLY WHEN NOTHING ELSE
+ * HERE ALREADY LOADS THAT MODULE — AND MOST DO.** An audit counted two hundred
+ * names in this file with no importer and read them as weight. They are not:
+ * almost every one sits beside a name that IS imported, in a module the barrel
+ * loads anyway. They stay, because they are a declared contract rather than a
+ * cost, and shrinking a contract on the grounds that today's capabilities
+ * happen not to use it is a different decision from removing dead weight.
+ *
+ * ⚠️ **`core/cardStore` AND `core/formats` WERE DROPPED AS "THE TWO MODULES
+ * THAT COST", AND NEITHER COST ANYTHING.** Both still load with this entry:
+ * `core/services.ts` imports `createCards` from the one and `core/bookFolder.ts`
+ * imports `isFormat` from the other, and this file re-exports both of those.
+ * What dropping the clauses bought is a smaller API — names nothing outside the
+ * kernel asked for — which is reason enough; the loading saving was a second
+ * reason that was not true. Found by audit.
+ *
+ * `kernel-entry.test.mjs` holds the NAMES, not the loading: it refuses a value
+ * clause none of whose names anything outside the entry imports, whether or not
+ * something else here loads the module behind it. It does not walk the module
+ * graph, so it can neither confirm nor refute a claim about what loads.
  */
 
 /* The services, and the factory a composition root calls once. */
@@ -71,8 +112,8 @@ export {
   resolvePaneId,
   /* THE CAPABILITY SETTINGS CONTRACT, exported so a capability's own tests can
    * hold themselves to it. A store built by hand in a test is a guard that can
-   * drift from the real one — and it did: both phase-15 panes read
-   * `kernel.lookUp` through their scoped handle and threw `namespace` on their
+   * drift from the real one — and it did: two deleted phase-15 panes read a
+   * `kernel.` key through their scoped handle and threw `namespace` on their
    * first render, while every unit test passed because each had been handed an
    * UNSCOPED store. */
   scopeSettings,
@@ -167,34 +208,42 @@ export {
 export type { DiagnosticEntry, DiagnosticLog, DiagnosticSpool } from './core/diagnosticsLog'
 export { CAPABILITY_UI, type CapabilityUiClass } from './core/capabilityUi'
 export { inlineQrSvg } from './core/qrSvg'
-/* EVERYTHING A CAPABILITY'S `start` ACQUIRED — see `core/capabilitySession.ts`. */
-export { openSession } from './core/capabilitySession'
-export type { CapabilitySession } from './core/capabilitySession'
-/* WHAT A CONTRIBUTED `render()` DRAWS — see `core/renderSlot.ts`. */
-export { createRenderSlot } from './core/renderSlot'
-export type { RenderSlot } from './core/renderSlot'
+/* ⚠️ **`core/capabilitySession.ts` AND `core/renderSlot.ts` ARE DELETED**, with
+ * the clauses that re-exported them. `openSession` released everything a
+ * capability's `start` acquired; `createRenderSlot` was a STACK for the value a
+ * no-argument `render()` draws, so two live compositions could not leave the
+ * older one rendering nothing. Both were right, and both had exactly two
+ * callers — the deleted `companion` and `inference`.
+ *
+ * They were kept for one round on the ground that `webhost` hand-rolls the same
+ * ownership check and would be the next caller. That is a plan, not a caller.
+ * Code with no caller and a comment explaining who might want it is the shape
+ * this repository keeps having to delete twice.
+ *
+ * THE DEFECT IS RECORDED WHERE IT HAPPENS, not here and not in a deleted
+ * header: `capabilities/webhost/index.ts` and its `index.test.ts` carry it,
+ * because webhost is the one capability that still has it. A third case is
+ * rebuilt from that incident rather than from the abstraction. */
 /* The first half of a shutdown: hand over what memory holds, so the queue has
  * something to drain. The composition root needs it for the QUIT path, which
- * is not the window-close path `App` already covers — see `beforeClose.ts`. */
-export { flushBeforeClose, onBeforeClose } from './core/beforeClose'
-/* The companion and the gloss (phase 15). The types a capability implements
- * to bind `KernelServices.bindCompanion` / `bindGloss`.
+ * is not the window-close path `App` already covers — see `beforeClose.ts`.
  *
- * ⚠️ **THE LOOK-UP CONSTANTS ARE GONE FROM HERE** — `LOOK_UP_MODES`,
- * `LOOK_UP_LABELS`, `LOOK_UP_SETTING`, `LookUpMode`, `isLookUpMode`,
- * `availableModes` and `effectiveMode` were exported so a capability's
- * settings pane could render the Look up cycle. There is no cycle: the system
- * dictionary hand-off is deleted and the gloss is the whole feature. A barrel's
- * re-exports evaluate with the barrel, so this is a saving as well as a
- * deletion. */
-export { NOT_CONFIGURED, NOT_CONFIGURED_REASON, UNKNOWN_CITATION_NOTE } from './core/companion'
-export type { AnswerEnd, AskContext, AskPassage, Citation, CompanionProvider } from './core/companion'
-/* ⚠️ `NO_GLOSS` IS NOT RE-EXPORTED. It is the port's unbound default and it is
- * `services.ts`'s to install, not a capability's to reach for — and an audit
- * confirmed no capability ever did. A barrel's re-exports evaluate with the
- * barrel, so an unused one is loaded rather than free. The TYPES stay: they
- * are what a capability implements to bind the port. */
-export type { GlossContext, GlossProvider } from './core/gloss'
+ * AND `onBeforeDrain`, the list of work already RUNNING that the drain waits
+ * for (2026-09-14). Registering is how anything outside the kernel puts a wait
+ * on both shutdown paths — and how `app/bootApp.test.ts` proves the quit's
+ * teardown is handed `settleBeforeDrain` at all, since a test under `src/app/`
+ * reaches the kernel through this entry and no other. The waiting half stays on
+ * `ui/boot.ts`, beside the bound it runs under. */
+export { flushBeforeClose, onBeforeClose, onBeforeDrain } from './core/beforeClose'
+/* ⚠️ **THE COMPANION, THE GLOSS AND THE VOICE PORTS ARE ALL GONE FROM HERE.**
+ * `NOT_CONFIGURED`, `CompanionProvider`, `Definition`, `GlossProvider`,
+ * `Voice`, `AnswerLanguage` and the rest were the shapes a capability
+ * implemented to bind `bindCompanion` / `bindGloss` / `bindVoice`. There are no
+ * such ports: every AI feature — the companion, Look up, the neural voice and
+ * the inference capability behind all three — was removed in one pass, and a
+ * barrel that still named their types would be the surface by which they came
+ * back one import at a time. A barrel's re-exports evaluate with the barrel, so
+ * this is a loading saving as well as a deletion. */
 /* WHAT A BOOK'S LINK MAY DO TO THE HOST, decided once and in one place.
  *
  * foliate hands any link whose scheme leaves the package to `globalThis.open`
@@ -298,11 +347,13 @@ export type { FileStore, FileStoreOptions, FileSystem } from './core/fileStore'
  * Public because sync's contentHash backfill is one of the two passes that
  * need it, and the other is the kernel's own enrichment. */
 export { breathe, restThenBreathe } from './core/breath'
-/* LAST-ISSUED WINS. Two subsystems raced their own async results and each
-   had grown a private counter; see `core/generations.ts`. */
-export { createGenerations } from './core/generations'
-export type { Generations } from './core/generations'
+/* ⚠️ **`createGenerations` IS NOT RE-EXPORTED EITHER**, for the same reason and
+   with the same module left in place: `ui/App.tsx` imports it directly, which
+   is a kernel file reaching a kernel file, and no capability asks for it.
+   Last-issued wins — two subsystems raced their own async results and each had
+   grown a private counter; see `core/generations.ts`. */
 export { writeQueue } from './core/writeQueue'
+export { notifyAll } from './core/notify'
 export type { WriteQueue } from './core/writeQueue'
 /* The circle's own store lives beside `marks.json` and never inside it — see
    `circlePathIn`. The paths are the kernel's because the folder layout is. */
@@ -466,7 +517,6 @@ export {
   createMark,
   isAnnotation,
   isBookmark,
-  isHighlight,
   liveMarks,
   markStamp,
   mergeMarks,
@@ -506,11 +556,18 @@ export {
 export type { Align, ContributedPaneId, KernelPaneId, PageLayout, PaneId, ReadingStyle, Screen, Side, SpacingIndices, Theme, Typeface } from './core/uiTypes'
 
 
-/* The design system's icon sizes. Exported for a capability's UI: `lucide`
- * takes a number, and a capability picking its own would be the one control in
- * the app drawn at a size nothing else uses. `ICON.control` is the size every
- * icon inside a control already takes. */
-export { ICON } from './core/metrics'
+/* The design system's icon sizes, and the list view's jacket. Exported for a
+ * capability's UI: `lucide` takes a number, and a capability picking its own
+ * would be the one control in the app drawn at a size nothing else uses.
+ * `ICON.control` is the size every icon inside a control already takes.
+ *
+ * `LIST_COL` and `COVER_ASPECT` are here for the same reason one step further
+ * out: a capability that draws a book's jacket in a row — the circle's roster
+ * does — has to size it, and `RosterSection` wrote `24×36` on its `<img>`,
+ * which is 2:3 done by hand next to the two constants that say it. The shelf's
+ * own list draws a 22px thumb at `COVER_ASPECT`; a jacket in a capability's row
+ * is the same object and should be the same size. */
+export { COVER_ASPECT, ICON, LIST_COL } from './core/metrics'
 
 /* THE ENVELOPE — a service call as bytes, and bytes back.
  *

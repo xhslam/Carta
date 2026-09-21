@@ -806,9 +806,7 @@ export function createLibrary({
 
   /** Tell every subscriber to re-read. Its own function because not every
    *  change is a change to the LIST — the undo offer moves on its own. */
-  const notify = () => {
-    for (const listener of [...listeners]) listener()
-  }
+  const notify = () => notifyAll(listeners, 'library')
 
   const publish = (next: readonly IndexedBook[]) => {
     books = next
@@ -2611,3 +2609,4 @@ export function createLibrary({
     applyRemoteRows,
   }
 }
+import { notifyAll } from './notify'

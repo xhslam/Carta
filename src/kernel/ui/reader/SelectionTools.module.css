@@ -29,6 +29,16 @@
   border: 1px solid var(--line-2);
   box-shadow: var(--shadow-pop);
   animation: rise var(--motion-popover) both;
+  /* SCROLLS WITHIN ITS BOUND, WHICHEVER FACE IT SHOWS. `SelectionTools` sets
+     `max-width` and `max-height` from the room the popup is placed in, because
+     placement can move a surface but cannot shrink one; this is what lets a
+     face bigger than that room still be reached — a row sideways, an answer
+     downwards. It was one face's rule alone until 2026-09-14 (#159), and a
+     bound on a row with nothing to scroll only clips its last controls.
+     A row's controls do not shrink (`flex: 0 0 auto`), so a narrow bound
+     overflows rather than squeezing them, and the overflow runs to the END,
+     where it can be scrolled to. */
+  overflow: auto;
 }
 
 /* §08: the popover rises rather than fading in place, and only 4px — enough to
@@ -157,7 +167,7 @@
  * than judging one in isolation. Anything heavier stops reading as the same
  * colour, more of it, and starts reading as a ringed colour. */
 .disc[data-lit='true'] {
-  box-shadow: 0 0 0 1px var(--disc);
+  box-shadow: var(--ring) var(--disc);
 }
 
 /* A drawing of the mark itself — see `MarkSpecimen`. */

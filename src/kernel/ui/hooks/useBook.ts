@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { TocItem } from 'foliate-js/view.js'
 import type { BookmarkPlace, MarkAnchor, SearchHit, SessionNavigator } from '../reader/session'
 import type { PassOutcome, PendingMark } from '../reader/reanchorPass'
-import type { AskPassage } from '../../core/companion'
 import type { BookMeta, ReaderPosition } from '../../core/bookMeta'
 import { bookIdFor } from '../../core/marks'
 
@@ -12,10 +11,10 @@ export type { SearchHit }
  * The open book.
  *
  * Lifted out of the reader because the book is no longer the reader's private
- * business: Contents needs its table of contents and Companion needs the
- * current chapter, and both now live in the side pane rather than in a column
- * the reader owns. One pane holding every tool means one place holding the
- * state those tools read.
+ * business: Contents needs its table of contents and Search needs the book to
+ * scan, and both live in the side pane rather than in a column the reader
+ * owns. One pane holding every tool means one place holding the state those
+ * tools read.
  */
 
 /* `ReaderPosition` and `BookMeta` are declared in `core/bookMeta` — they are
@@ -86,8 +85,6 @@ export interface Book extends BookState {
   eraseMark: (anchor: MarkAnchor) => void
   /** Clear the book's own text selection. */
   deselect: () => void
-  /** The book text on screen, as passages a companion answer can cite. */
-  passages: () => readonly AskPassage[]
   /**
    * Walk this book for marks with no anchor here — WI-22.A2, `useReanchor`'s.
    *
@@ -114,14 +111,6 @@ export interface Book extends BookState {
    */
   goLeft: () => void
   goRight: () => void
-  /**
-   * A counter that advances on every page turn, from every route.
-   *
-   * For a surface anchored to the page the reader is on — see the note beside
-   * the verbs. NOT a position: it moves only when a turn was ASKED for, so a
-   * re-pagination cannot move it.
-   */
-  navigation: number
   /**
    * Where the reader is, as everything a bookmark is made from — null before
    * the renderer is up, and for a place that cannot be pinned down.
@@ -298,7 +287,6 @@ export function useBook(): Book {
   /* Reads through the ref like everything else here, so it answers about
      whatever book is open now rather than the one this callback was made
      for. `[]` before a navigator exists — the honest empty. */
-  const passages = useCallback((): readonly AskPassage[] => navigatorRef.current?.passages() ?? [], [])
   /* `complete: false` for the absent navigator — see the interface. */
   const reanchor = useCallback(
     (pending: readonly PendingMark[]): Promise<PassOutcome> =>
@@ -348,24 +336,16 @@ export function useBook(): Book {
    * surface anchored to the page appears — so an anchor keyed on it would take
    * down the thing that caused the reflow, and loop.
    */
-  const [navigation, setNavigation] = useState(0)
-  const turned = useCallback(() => setNavigation((n) => n + 1), [])
-  const next = useCallback(() => {
-    turned()
-    navigatorRef.current?.next()
-  }, [turned])
-  const prev = useCallback(() => {
-    turned()
-    navigatorRef.current?.prev()
-  }, [turned])
-  const goLeft = useCallback(() => {
-    turned()
-    navigatorRef.current?.goLeft()
-  }, [turned])
-  const goRight = useCallback(() => {
-    turned()
-    navigatorRef.current?.goRight()
-  }, [turned])
+  /* ⚠️ **A `navigation` COUNTER RODE ON THESE FOUR AND IS GONE** (2026-09-19
+   * audit). It advanced on every asked-for turn, for a surface anchored to the
+   * page the reader was on — the deleted gloss's anchor, its only consumer. Left
+   * behind, it called `setNavigation` on the app's hottest interaction and
+   * re-rendered every reader of this hook for a value nothing read. The verbs
+   * delegate and nothing else now. */
+  const next = useCallback(() => navigatorRef.current?.next(), [])
+  const prev = useCallback(() => navigatorRef.current?.prev(), [])
+  const goLeft = useCallback(() => navigatorRef.current?.goLeft(), [])
+  const goRight = useCallback(() => navigatorRef.current?.goRight(), [])
   const placeHere = useCallback(() => navigatorRef.current?.placeHere() ?? null, [])
   /* GENERATION-TAGGED like every other renderer callback. It was the only one
    * that was not, so a session being torn down could install ITS navigator over
@@ -448,7 +428,6 @@ export function useBook(): Book {
       drawMark,
       eraseMark,
       deselect,
-      passages,
       reanchor,
       closeFootnote,
       setFootnoteMount,
@@ -456,7 +435,6 @@ export function useBook(): Book {
       prev,
       goLeft,
       goRight,
-      navigation,
       placeHere,
       setNavigator,
       setToc,
@@ -490,7 +468,6 @@ export function useBook(): Book {
       drawMark,
       eraseMark,
       deselect,
-      passages,
       reanchor,
       closeFootnote,
       setFootnoteMount,
@@ -498,7 +475,6 @@ export function useBook(): Book {
       prev,
       goLeft,
       goRight,
-      navigation,
       placeHere,
       setNavigator,
       setToc,

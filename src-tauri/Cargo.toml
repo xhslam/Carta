@@ -1,10 +1,10 @@
 [package]
 name = "app"
-version = "0.3.0"
-description = "Carta — an ebook reader with a companion"
+version = "0.4.0"
+description = "Carta — an ebook reader"
 authors = ["Carta"]
 license = "MIT"
-repository = "https://github.com/xiaolai/paper-one"
+repository = "https://github.com/xiaolai/carta-one"
 edition = "2021"
 rust-version = "1.91"
 
@@ -80,16 +80,9 @@ tauri-plugin-peer = { path = "crates/tauri-plugin-peer" }
 # library, not a capability, so no capability's removal takes it away.
 carta-data-root = { path = "crates/carta-data-root" }
 carta-process = { path = "crates/carta-process" }
-# The local inference runtime (crates/tauri-plugin-inference). DESKTOP ONLY and
-# therefore optional: `lemond` ships for macOS, Windows and Linux and there is
-# no mobile build of it, so a phone has nothing for this plugin to supervise.
-# Gating it here — rather than only at the `.plugin()` call — is what keeps its
-# rustls provider from being compiled for iOS and Android at all.
-tauri-plugin-inference = { path = "crates/tauri-plugin-inference", optional = true }
-# The shelf's web face (phase 18). DESKTOP ONLY and therefore optional, for the
-# same reason the local inference runtime is: a phone is a satchel, never a
-# shelf, and has nothing to serve. Gating it here rather than at the router
-# keeps it out of the mobile build entirely.
+# The shelf's web face (phase 18). DESKTOP ONLY and therefore optional: a phone
+# is a satchel, never a shelf, and has nothing to serve. Gating it here rather
+# than at the router keeps it out of the mobile build entirely.
 #
 # NOTE FOR ANYONE EDITING THIS COMMENT: do not name another path crate in it.
 # `capability:remove` cuts a crate by purging its name from this file, and
@@ -139,11 +132,10 @@ tauri-plugin-webhost = { path = "crates/tauri-plugin-webhost", optional = true }
 #
 # `reqwest` is configured `rustls-no-provider` across this workspace, which
 # turns off rustls's automatic provider selection: the PROCESS must install one
-# before anything builds a `Client`. On desktop the local inference plugin
-# brings that provider — which is exactly what its own note above says is being
-# kept out of the mobile build — so gating that plugin off left iOS and Android
-# with no provider at all. iroh still builds a client for its relays, so the app
-# panicked on the FIRST LAUNCH, every launch:
+# before anything builds a `Client`. The deleted inference plugin brought that
+# provider on desktop and was itself kept out of the mobile build, so iOS and
+# Android had no provider at all. iroh still builds a client for its relays, so
+# the app panicked on the FIRST LAUNCH, every launch:
 #
 #   No rustls crypto provider is configured. When using the
 #   `rustls-no-provider` feature you must install a crypto provider before
@@ -178,7 +170,6 @@ desktop = [
     "dep:tauri-plugin-persisted-scope",
     "dep:tauri-plugin-single-instance",
     "dep:tauri-plugin-window-state",
-    "dep:tauri-plugin-inference",
     "dep:tauri-plugin-webhost",
     "tauri/tray-icon",
 ]
@@ -193,3 +184,30 @@ android = ["tauri-plugin-peer/android"]
 [workspace]
 members = ["crates/*"]
 resolver = "2"
+
+# ⚠️ **ONE DECLARATION, BECAUSE TWO PLUGINS WERE KEEPING IT IN STEP BY HAND.**
+# The peer transport and the deleted inference plugin both stored a secret in
+# the platform credential store, and both carried the same version and the same
+# feature list with comments in each telling the next reader to copy any change
+# to the other. Two manifests naming different feature sets for one crate is
+# how a unification surprise arrives — which is what those comments said, and
+# what nothing enforced. One consumer is left and the declaration stays here:
+# the next crate that needs a credential store finds the answer rather than
+# writing a second one. Found by audit.
+#
+# ⚠️ **NEITHER PLUGIN IS NAMED HERE, AND THAT IS NOT STYLE.**
+# `scripts/lib/removal.test.mjs` cuts every path dependency out of this
+# manifest and requires the crate's NAME to be gone from the text — a plugin
+# has to stay removable, and a comment mentioning one keeps it present after
+# its dependency line is cut. Found by walking into it.
+#
+# `crypto-rust` is what encrypts the Linux Secret Service session. Without it
+# keyring passes `EncryptionType::Plain` and a secret crosses the session
+# D-Bus in the clear.
+[workspace.dependencies]
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }

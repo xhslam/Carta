@@ -21,13 +21,13 @@
      scheme is invisible — which is the place they are reading it from. The
      rule colour rather than the fill: 2px of a pale band is not a colour, it
      is a smudge. Falls back to the gold for a mark made before tints. */
-  border-inline-start: 2px solid var(--mark-yellow-rule);
+  border-inline-start: var(--kind-rule-w) solid var(--mark-yellow-rule);
   border-radius: 0 var(--radius-chip) var(--radius-chip) 0;
   background: none;
   color: var(--muted);
   font-family: inherit;
   font-size: var(--text-small);
-  line-height: 1.45;
+  line-height: var(--leading-ui);
   text-align: start;
   cursor: pointer;
   pointer-events: auto;
@@ -50,29 +50,6 @@
 
 .mark[data-tint='purple'] {
   border-inline-start-color: var(--mark-purple-rule);
-}
-
-/* §01: the companion's provenance is amber in every theme, Night included.
- * AFTER the tints, and it must stay after them: the companion's mark carries a
- * tint like any other row — nothing stops one being stored — and amber is what
- * says whose mark it is, so it wins. */
-.mark[data-kind='companion'] {
-  border-inline-start-color: var(--amber-line);
-  color: var(--amber);
-}
-
-.mark[data-kind='companion']:hover {
-  background: var(--amber-bg);
-}
-
-.kind {
-  display: block;
-  margin-bottom: var(--space-2);
-  font-size: var(--text-micro);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--track-caps);
-  text-transform: uppercase;
-  color: var(--amber);
 }
 
 /* Two lines, then ellipsis. A margin note is a pointer to the note, not the

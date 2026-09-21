@@ -12,5 +12,5 @@
  * one module — the cost `src/kernel/ui/browser.ts`'s own note measures at half
  * a percent of function coverage for ten unused surfaces.
  */
-export { connect, socketUrl } from '../../kernel/core/shelfChannel'
-export type { ClosedReason, ConnectOptions, ShelfChannel, SocketLike } from '../../kernel/core/shelfChannel'
+export { connectToShelf as connect, socketUrl } from '../../kernel'
+export type { ClosedReason, ConnectOptions, ShelfChannel, SocketLike } from '../../kernel'

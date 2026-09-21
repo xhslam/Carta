@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Asterisk,
   /* Aliased: `Bookmark` is also the record type this file is largely about,
@@ -9,7 +9,6 @@ import {
   Layers,
   LibraryBig,
   PenLine,
-  Sparkles,
   Trash2,
 } from 'lucide-react'
 import { cardFromMark } from '../../core/cards'
@@ -21,7 +20,6 @@ import {
   type Annotation,
   type Bookmark,
   type Mark,
-  isHighlight,
   MAX_MARK_NOTE,
 } from '../../core/marks'
 import type { MarkFocus } from '../hooks/useMarking'
@@ -59,11 +57,24 @@ const hasNote = (mark: { readonly note: string }): boolean => mark.note.trim() !
 /** §11: say what happened and what to do. A store that has quietly stopped saving looks exactly like one that works. */
 const NOT_SAVING = "Marginalia is not being saved — this device's storage is unavailable."
 
+/**
+ * The same sentence for the cards this panel makes — their own store and their
+ * own flag (`CardsView.persistent`), which the panel could not see (#132).
+ */
+const NOT_SAVING_CARDS = "Cards you make are not being saved — this device's storage is unavailable."
+
 /** The one sentence for a marks file that would not read, wherever it stands. */
 const UNREADABLE_MARKS =
   "This book's marks file could not be read. It is left as it is, and marks made now are not being saved over it."
-/** The cross-book scan failed — said instead of the empty state, never beside it. */
+/**
+ * The cross-book scan failed — said instead of the empty state, never beside
+ * it; and above a list that IS shown, which it used to be kept out of (#129).
+ */
 export const SCAN_FAILED_MARKS = 'Your marks could not be read'
+/** What to do about a failed scan, wherever it is said. */
+const SCAN_FAILED_NEXT = 'Nothing on disk has been changed. Close and reopen the panel to try again.'
+/** The cross-book scan is still running — over an empty panel or above a partial list (#130). */
+const SCANNING_MARKS = 'Reading your marks…'
 import type { MarksView } from '../hooks/useMarks'
 import { comboFor } from '../panes'
 import { FilterChips } from './FilterChips'
@@ -79,7 +90,7 @@ import { ContributionBoundary, ContributionBody } from '../ContributionBoundary'
  * IT WAS CALLED NOTES, and the name stopped being true when bookmarks joined
  * it. §15's lexicon is precise about the two words it owns — a **mark** is the
  * highlight, a **note** is what you wrote on it — and a panel holding marks,
- * notes, the companion's claims AND places named itself after one of the four.
+ * notes AND places named itself after one of the three.
  * "Annotations" was the obvious replacement and is the one word §15 rules out
  * for this panel. Marginalia is what a reader leaves in a book, which is
  * exactly the union; a bookmark is not written, which is the one place the word
@@ -90,8 +101,12 @@ import { ContributionBoundary, ContributionBody } from '../ContributionBoundary'
  * "This book" mutually exclusive with "Marks", which is not what either means.
  */
 
-type KindFilter = 'All' | 'Marks' | 'Notes' | 'Bookmarks' | 'Companion'
-const KINDS: readonly KindFilter[] = ['All', 'Marks', 'Notes', 'Bookmarks', 'Companion']
+/* ⚠️ **TWO CHIPS ARE GONE FROM HERE**: `Companion`, which filtered on a mark
+   kind that no longer exists, and `Dictionary`, which was not a mark kind at
+   all — it swapped the panel's whole BODY for the lookup history. Both went
+   with the AI features. */
+type KindFilter = 'All' | 'Marks' | 'Notes' | 'Bookmarks'
+const KINDS: readonly KindFilter[] = ['All', 'Marks', 'Notes', 'Bookmarks']
 
 /** The scope chips. Only offered with a book open — see the render. */
 type ScopeFilter = 'All books' | 'This book'
@@ -101,13 +116,13 @@ const SCOPES: readonly ScopeFilter[] = ['All books', 'This book']
  * The chips are icons, and each one BORROWS AN ASSOCIATION THE APP HAS ALREADY
  * TAUGHT rather than inventing a glyph.
  *
- * Sparkles is the Companion's own rail icon and LibraryBig is the Library's, so
- * a reader who has used either panel already knows what those two mean here.
+ * LibraryBig is the Library's own rail icon, so a reader who has used that
+ * panel already knows what it means here.
  * Bookmark is the ribbon the toggle draws on the page. Highlighter is this
  * panel's own rail icon, which is right for the kind of thing this panel is
  * mostly made of. PenLine is the note — §15's word for what you wrote on a
  * mark — and BookOpen is the one you have open. Asterisk is the wildcard, which
- * is the only one of the seven that is a convention rather than a recall.
+ * is the only one of the five that is a convention rather than a recall.
  *
  * Typed as a total Record, so adding a filter without an icon fails to compile
  * instead of drawing an empty button — see `FilterChipsProps.icons`.
@@ -117,7 +132,6 @@ const KIND_ICONS: Readonly<Record<KindFilter, typeof Asterisk>> = {
   Marks: Highlighter,
   Notes: PenLine,
   Bookmarks: BookmarkIcon,
-  Companion: Sparkles,
 }
 
 const SCOPE_ICONS: Readonly<Record<ScopeFilter, typeof Asterisk>> = {
@@ -126,11 +140,12 @@ const SCOPE_ICONS: Readonly<Record<ScopeFilter, typeof Asterisk>> = {
 }
 
 function matches(mark: Mark, filter: KindFilter): boolean {
+  /* EVERY CHIP WRITTEN OUT, never a default, so the day `KindFilter` grows
+     again this switch fails to compile instead of quietly filing marks under
+     the wrong chip. */
   switch (filter) {
     case 'All':
       return true
-    case 'Companion':
-      return mark.kind === 'companion'
     /* A BOOKMARK HAS NO NOTE and never will — `bookmarkFrom` writes an empty
      * one and says why — so it cannot appear under Notes by accident. Stated
      * rather than relied on: the filters are read by someone deciding what a
@@ -145,6 +160,12 @@ function matches(mark: Mark, filter: KindFilter): boolean {
   }
 }
 
+/** A row's words for a note whose newest write was refused — see `MarksView.unsaved`. */
+function unsavedLabel(draft: string | undefined): string | null {
+  if (draft === undefined) return null
+  return draft.trim() === '' ? 'Not saved — the note was cleared' : `Not saved — ${draft.trim()}`
+}
+
 /**
  * The note editor, which saves whatever it is holding when it goes away.
  *
@@ -156,11 +177,24 @@ function matches(mark: Mark, filter: KindFilter): boolean {
  */
 interface NoteEditorProps {
   initial: string
-  onCommit: (value: string) => void
+  /**
+   * Hand the note over, and say whether it landed — see `MarksView.setNote`.
+   *
+   * A promise rather than a void call, because this editor is the one holder of
+   * the text and a refused write is only recoverable while it still has it.
+   * `void` is accepted for a host that cannot answer; nothing written that way
+   * can be retried, which is the honest reading of an answer nobody gave.
+   */
+  onCommit: (value: string) => void | Promise<void>
   onDone: () => void
+  /**
+   * The text of a write the store REFUSED, to start from instead of the note —
+   * see `MarksView.unsaved`. Absent for an ordinary open.
+   */
+  unsaved?: string | undefined
 }
 
-function NoteEditor({ initial, onCommit, onDone }: NoteEditorProps) {
+function NoteEditor({ initial, unsaved, onCommit, onDone }: NoteEditorProps) {
   /**
    * The latest text, tracked as it is typed.
    *
@@ -168,10 +202,10 @@ function NoteEditor({ initial, onCommit, onDone }: NoteEditorProps) {
    * unmount cleanup runs React has already detached the ref — `field.current`
    * is null and the save silently keeps nothing, which is the exact failure
    * this editor exists to prevent, moved one step later. The element is still
-   * needed for the initial value and for blur; it is just not the source of
-   * truth at teardown.
+   * needed for the initial value, for blur, and for taking a newer note; it is
+   * just not the source of truth at teardown.
    */
-  const draft = useRef(initial)
+  const draft = useRef(unsaved ?? initial)
   /**
    * What is already stored, so an unchanged note is not written again.
    *
@@ -180,17 +214,176 @@ function NoteEditor({ initial, onCommit, onDone }: NoteEditorProps) {
    * to be stored with a leading space differed from itself: opening it and
    * closing it again rewrote it — a new HLC stamp, a write, and a row that
    * looks edited to every replica, for a note nobody touched.
+   *
+   * WHAT THE STORE HOLDS, which is not always what the editor opened with — see
+   * the effect below.
+   *
+   * ⚠️ **NULL — UNKNOWN — WHEN IT OPENS ON A REFUSED DRAFT** (2026-09-14, #131,
+   * round 4). The row's note is not what the store holds then: for the open
+   * book the store draws a note before its write lands and does not take it
+   * back, so the row already reads as the refused text, and an editor that took
+   * that for stored found the draft "unchanged" and never wrote it again.
+   * Unknown equals nothing, so the first save writes whatever the field holds,
+   * and that write landing is what makes it known.
+   *
+   * THE EFFECT BELOW IS WHAT MAKES IT NULL, at mount as well as after. It runs
+   * before anything reads `stored`, so deciding it here too was a second copy
+   * of one rule — and a condition whose two answers nothing could tell apart.
    */
-  const stored = useRef(initial.trim())
+  const stored = useRef<string | null>(initial.trim())
+  /* ⚠️ **AND WHEN A WRITE IS REFUSED AFTER THE EDITOR OPENED** (2026-09-14
+     verify). `stored` was decided only at mount, so an editor reopened while its
+     write was still out took the note the store drew — before that write had
+     landed — for what the store held, and the refusal that arrived afterwards
+     never reset it: saves found the draft unchanged and a blur closed the editor
+     over a note that was not saved. A refused draft makes the store's copy
+     unknown again — on the editor's first render as on any later one. */
+  useEffect(() => {
+    if (unsaved !== undefined) stored.current = null
+  }, [unsaved])
+  /** The values handed over and not yet seen coming back, oldest first. */
+  // Stryker disable next-line ArrayDeclaration: a seeded entry is found only by an arriving note that reads exactly the mutator's own sentinel.
+  const submitted = useRef<string[]>([])
+  /**
+   * The value whose write is in flight, or null.
+   *
+   * ⚠️ **`stored` USED TO MOVE THE MOMENT THE NOTE WAS HANDED OVER**, so a
+   * write that failed looked exactly like one that landed: every later save
+   * found the draft "unchanged" and wrote nothing, and closing the editor took
+   * the draft with it (#131). `stored` now means WHAT THE STORE HAS, and this
+   * means what it has been asked for — which is the other half of the fix,
+   * because without it the one-second timer would hand the same text over on
+   * every tick until the write came back.
+   */
+  const writing = useRef<string | null>(null)
+  const field = useRef<HTMLTextAreaElement | null>(null)
   const commit = useRef(onCommit)
   commit.current = onCommit
+  const done = useRef(onDone)
+  done.current = onDone
+
+  /**
+   * Blurred, and waiting for the store to have the draft before closing.
+   *
+   * ⚠️ **A BLUR CLOSED THE EDITOR AT ONCE, AND THE RETRY LIVES IN HERE**
+   * (2026-09-14, #131). Keeping the draft until a write landed fixed a refusal
+   * that arrived while the editor was open; one arriving a moment AFTER the
+   * reader clicked away found the editor gone and nothing left to retry with,
+   * so the text went with it. A blur now closes only a note the store already
+   * has. Otherwise the field stays on screen, unfocused, holding the draft —
+   * the timer and every other save go on retrying it — and closes when a write
+   * lands. Focusing it again cancels the close.
+   *
+   * THE SMALLER OF TWO FIXES, AND NOT ENOUGH ALONE. The other kept the refused
+   * text outside the editor and had the row offer it again. This said an
+   * unmount that is not a blur "still takes the draft, exactly as before" — and
+   * closing the pane while a write was out did exactly that, once the write was
+   * refused (2026-09-14, #131, round 4). Both exist now: this keeps a blurred
+   * editor on screen, and `MarksView.unsaved` keeps what a refused write carried
+   * once no editor is left to — only the newest write's answer counts there, so
+   * the two copies cannot disagree about which text is the reader's.
+   */
+  const leaving = useRef(false)
+  const leaveIfLanded = useCallback(() => {
+    if (!leaving.current || writing.current !== null || draft.current.trim() !== stored.current) return
+    // Stryker disable next-line BooleanLiteral: `onDone` unmounts this editor, and the unmount resets `leaving` before its own save — nothing reads it in between.
+    leaving.current = false
+    done.current()
+  },
+  // Stryker disable next-line ArrayDeclaration: any constant list keeps this callback stable, which is all the list is for.
+  [])
 
   const save = useCallback(() => {
     const value = draft.current.trim()
-    if (value === stored.current) return
-    stored.current = value
-    commit.current(value)
-  }, [])
+    /* ⚠️ **AGAINST WHAT THE STORE WILL HOLD, NOT WHAT IT LAST CONFIRMED.** This
+       skipped a draft equal to `stored` even while a newer write was out, so A
+       saved → B handed over → A typed back → closed → B landed, and the disk
+       kept B (2026-09-14 verify). While a write is out, it is the one the store
+       will end up holding. */
+    if (value === (writing.current ?? stored.current)) return
+    writing.current = value
+    submitted.current.push(value)
+    const landed = () => {
+      /* ONLY WHAT THIS WRITE CARRIED. A newer save may have started while
+         this one was in flight, and it owns the marker after this. */
+      if (writing.current === value) writing.current = null
+      stored.current = value
+      leaveIfLanded()
+    }
+    const answer = commit.current(value)
+    /* A HOST THAT ANSWERS NOTHING has landed it, and NOW — there is nothing to
+       retry with an answer nobody gave, and nothing to hold a blurred editor
+       open for. This was a `Promise.resolve` over both, which made even a
+       silent host's close wait a turn. */
+    if (answer === undefined) {
+      landed()
+      return
+    }
+    void Promise.resolve(answer).then(
+      landed,
+      () => {
+        /* REFUSED, so the store does not have it and the draft is still the
+           only copy. `stored` is left where it was, which is what makes the
+           next tick, blur or unmount try again. The failure is reported by
+           `useMarks` and shown by the panel's own not-saving line. */
+        if (writing.current === value) writing.current = null
+      },
+    )
+  },
+  // Stryker disable next-line ArrayDeclaration: `leaveIfLanded` never changes, so listing it or not keeps `save` the same callback.
+  [leaveIfLanded])
+
+  /**
+   * A newer note, arriving while the editor is open — from sync, or from
+   * another window.
+   *
+   * ⚠️ **IT WAS IGNORED, AND THE NEXT KEYSTROKE WROTE OVER IT.** `initial` was
+   * read once, as the field's default, so the old text stayed on screen and
+   * whatever the reader typed onto it was saved over the newer note (2026-09-13
+   * audit, #127).
+   *
+   * THE EDITOR'S OWN SAVES COME BACK THROUGH HERE TOO, and are not news. A mark
+   * in another book is republished only once its file is written, so a save can
+   * come back after a later one was made — taken for somebody else's note, it
+   * would put the earlier text back under the reader's cursor. Writes land in
+   * order, so seeing one come back means every save before it has landed too.
+   *
+   * UNTOUCHED, the field takes the newer note. MID-SENTENCE, the reader's words
+   * stay — a keystroke is never thrown away for a note they have not seen — and
+   * `stored` still learns what the store holds, so what the field shows is saved
+   * over it rather than left on screen unsaved.
+   */
+  /** A newer note that arrived mid-sentence, offered beside the field — or null. */
+  const [newer, setNewer] = useState<string | null>(null)
+  useEffect(() => {
+    const incoming = initial.trim()
+    const own = submitted.current.indexOf(incoming)
+    if (own !== -1) {
+      submitted.current.splice(0, own + 1)
+      return
+    }
+    if (incoming === stored.current) return
+    /* UNKNOWN IS NOT UNTOUCHED — see `stored` — and it stays unknown: a refused
+       draft is kept over an arriving note and written over it, as words typed
+       mid-sentence are. On the mount this runs at, the note IS the row's, which
+       is exactly what must not be learned as stored. */
+    if (stored.current === null) return
+    const untouched = draft.current.trim() === stored.current
+    stored.current = incoming
+    /* ⚠️ **AND IT IS SAID, NOT ONLY KEPT** (decided 2026-09-14, #127). The
+       reader's words stayed and were saved over the newer note in silence, so a
+       note written on another device was replaced without its reader ever
+       learning it existed. Keeping the draft stays the default; the newer
+       version is offered beside the field, one press away. */
+    if (!untouched) {
+      setNewer(initial)
+      return
+    }
+    draft.current = initial
+    /* ASSERTED, not tested: the field renders unconditionally beside this
+       effect, so a guard here decided nothing any render could show. */
+    field.current!.value = initial
+  }, [initial])
 
   /**
    * Hand the draft over before the window closes.
@@ -205,6 +398,7 @@ function NoteEditor({ initial, onCommit, onDone }: NoteEditorProps) {
    * empty. It stays below as the browser's path, where there is no close-request
    * to intercept.
    */
+  // Stryker disable next-line ArrayDeclaration: `save` never changes, so the registration is made once either way.
   useEffect(() => onBeforeClose(save), [save])
 
   /**
@@ -217,7 +411,9 @@ function NoteEditor({ initial, onCommit, onDone }: NoteEditorProps) {
   useEffect(() => {
     const idle = window.setInterval(save, 1000)
     return () => window.clearInterval(idle)
-  }, [save])
+  },
+  // Stryker disable next-line ArrayDeclaration: `save` never changes, so the timer is started once either way.
+  [save])
 
   useEffect(() => {
     // `pagehide` rather than `beforeunload`: it fires on the path a webview
@@ -229,27 +425,60 @@ function NoteEditor({ initial, onCommit, onDone }: NoteEditorProps) {
     return () => {
       window.removeEventListener('pagehide', save)
       document.removeEventListener('visibilitychange', save)
+      /* GONE, so a write landing later closes nothing — `onDone` would close
+         whichever editor the panel has opened since. */
+      leaving.current = false
       save()
     }
-  }, [save])
+  },
+  // Stryker disable next-line ArrayDeclaration: `save` never changes, so the listeners are added once either way.
+  [save])
 
   return (
-    <textarea
-      className={styles.noteInput}
-      defaultValue={initial}
-      autoFocus
-      /* The store cuts a note at this length on every read; the field stops
-         the reader there so nothing typed is lost to the cut. */
-      maxLength={MAX_MARK_NOTE}
-      placeholder="Write a note"
-      onChange={(event) => {
-        draft.current = event.target.value
-      }}
-      onBlur={() => {
-        save()
-        onDone()
-      }}
-    />
+    <>
+      <textarea
+        ref={field}
+        className={styles.noteInput}
+        defaultValue={unsaved ?? initial}
+        autoFocus
+        /* The store cuts a note at this length on every read; the field stops
+           the reader there so nothing typed is lost to the cut. */
+        maxLength={MAX_MARK_NOTE}
+        placeholder="Write a note"
+        onChange={(event) => {
+          draft.current = event.target.value
+        }}
+        onFocus={() => {
+          leaving.current = false
+        }}
+        onBlur={() => {
+          leaving.current = true
+          save()
+          leaveIfLanded()
+        }}
+      />
+      {newer !== null && (
+        <div className={styles.panelMeta}>
+          <span>A newer version of this note arrived while you were typing.</span>{' '}
+          <button
+            type="button"
+            className={styles.noteJump}
+            /* KEEPS THE FOCUS IN THE FIELD. A press that took it would blur the
+               editor first, and the blur saves the draft — over the very version
+               this button is about to put back. */
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              draft.current = newer
+              /* The field is drawn beside this button, always — see above. */
+              field.current!.value = newer
+              setNewer(null)
+            }}
+          >
+            Use that version
+          </button>
+        </div>
+      )}
+    </>
   )
 }
 
@@ -270,6 +499,52 @@ function useNow(injected: number | undefined): number {
     return () => window.clearInterval(tick)
   }, [injected])
   return injected ?? now
+}
+
+/**
+ * The control that takes a row to its place — a mark row's and a place row's.
+ *
+ * ONE CONTROL, WHERE THERE WERE TWO COPIES (#133), and the copies had already
+ * come apart once. ⚠️ A place row can be unplaced too — an imported bookmark is
+ * an unplaced mark of the bookmark class — and that row was disabled with NO
+ * explanation at all, so the reader saw the book open in front of them and a
+ * control that silently did nothing. MEASURED: `title` and `aria-description`
+ * both null on the bookmark row of a name-matched import, while the annotation
+ * beside it explained itself.
+ *
+ * The rule and the reason are shared; what each row shows inside the control
+ * is its own — the passage on a mark row, the chapter and its line on a place.
+ */
+function JumpButton({
+  mark,
+  reachable,
+  onGoTo,
+  children,
+}: {
+  readonly mark: Mark
+  /** `Marginalia`'s `reachable`, computed once by the panel and handed down. */
+  readonly reachable: boolean
+  readonly onGoTo?: ((target: JumpTarget) => void) | undefined
+  readonly children: ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      className={styles.noteJump}
+      /* A control that silently does nothing is worse than none: disabled where
+         there is nowhere to go, or no way of going. */
+      disabled={!reachable || !onGoTo}
+      /* SAYS WHY, when the reason is not the obvious one. A row for a book that
+         has left the shelf explains itself — the book is gone. An unplaced
+         mark's book is right there and open, so a control that does nothing
+         looks like a defect unless it says otherwise. */
+      {...(mark.unplaced ? { title: UNPLACED_TITLE, 'aria-description': UNPLACED_TITLE } : {})}
+      /* Stryker disable next-line OptionalChaining: without `onGoTo` the button is disabled, and a disabled button is never clicked. */
+      onClick={() => onGoTo?.({ bookId: mark.bookId, cfi: mark.cfi })}
+    >
+      {children}
+    </button>
+  )
 }
 
 /**
@@ -308,29 +583,14 @@ function PlaceRow({
       {/* NO BOOK LINE HERE. The row wrapper above draws it for every mark that
           is not from the open one, place rows included — drawing a second here
           printed the title twice on every cross-book bookmark. */}
-      <button
-        type="button"
-        className={styles.noteJump}
-        /* THE SAME RULE THE MARK ROW FOLLOWS, computed once by the panel and
-           handed down — see `reachable` there. It used to be "only the open
-           book"; it is now "a book still on the shelf", and a place in a book
-           Carta no longer holds is the case that stays disabled. */
-        disabled={!reachable || !onGoTo}
-        /* SAYS WHY, exactly as the mark row does. ⚠️ A place row can be
-           unplaced too — an imported bookmark is an unplaced mark of the
-           bookmark class — and this row was disabled with NO explanation at
-           all, so the reader saw the book open in front of them and a control
-           that silently did nothing. MEASURED: `title` and `aria-description`
-           both null on the bookmark row of a name-matched import, while the
-           annotation beside it explained itself. The reason the mark row gives
-           for carrying this is the same one, and it is why the two rows share
-           the sentence rather than each wording its own. */
-        {...(bookmark.unplaced ? { title: UNPLACED_TITLE, 'aria-description': UNPLACED_TITLE } : {})}
-        onClick={() => onGoTo?.({ bookId: bookmark.bookId, cfi: bookmark.cfi })}
-      >
+      {/* THE SAME RULE THE MARK ROW FOLLOWS, computed once by the panel and
+          handed down — see `reachable` there. It used to be "only the open
+          book"; it is now "a book still on the shelf", and a place in a book
+          Carta no longer holds is the case that stays disabled. */}
+      <JumpButton mark={bookmark} reachable={reachable} onGoTo={onGoTo}>
         <span className={styles.placeChapter}>{chapter}</span>
         {line && <span className={`${styles.noteBody} ${styles.placeLine}`}>{line}</span>}
-      </button>
+      </JumpButton>
       <div className={styles.noteSource}>
         <span>{relativeTime(bookmark.createdAt, now)}</span>
         {onDelete && (
@@ -404,8 +664,19 @@ export interface MarginaliaProps {
      * "Add a note", accepted the typing, and threw it away on commit. The
      * reader loses the note they just wrote and is told nothing. Not drawing
      * the editor is the accurate rendering of a session that may read marks.
+     *
+     * THE PARAMETERS ARE `MarksView`'S AND THE ANSWER IS WIDER. The desktop
+     * hands back whether the note landed, and the editor retries one that did
+     * not (#131); the browser client's wire-fed store answers nothing, and
+     * nothing is what the editor then has to retry with. A prop that demanded
+     * the promise would have turned that host away for a capability it cannot
+     * offer yet, rather than taking what it has.
      */
-    readonly setNote?: MarksView['setNote'] | undefined
+    readonly setNote?: ((...args: Parameters<MarksView['setNote']>) => void | Promise<void>) | undefined
+    /** Notes whose newest write was refused — see `MarksView.unsaved`. Optional
+     *  for the same reason `setNote` answers nothing there: the browser client's
+     *  wire-fed store has no refusal to hold. */
+    readonly unsaved?: MarksView['unsaved']
     /* Called on mount. On the desktop this is one read PER BOOK, which is why
      * the pane pays for it only when opened; over a channel `mark.list` with no
      * book is a single call, so a browser host's `loadAll` is cheap. */
@@ -419,9 +690,14 @@ export interface MarginaliaProps {
    * cannot answer that shape, and a stub returning a fabricated card would put
    * a made thing on screen that the shelf never received.
    */
-  /* `make` is all this panel asks of the cards — the whole `CardsView` coupled
-   * it to card state and verbs it never reads. */
-  cards?: Pick<CardsView, 'make'> | undefined
+  /* `make`, and whether what it writes is kept — the whole `CardsView` coupled
+   * it to card state and verbs it never reads.
+   *
+   * ⚠️ `persistent` WAS NARROWED AWAY WITH THEM, and it is not state this panel
+   * never reads: `make` lets its write go and reports a refusal only through
+   * that flag, and the Cards panel that draws it is not offered to a reader. So
+   * a card made here that was never saved was said nowhere (#132). */
+  cards?: Pick<CardsView, 'make' | 'persistent'> | undefined
   /** The open book, so its marks can be shown first. Null when none is open. */
   bookId: string | null
   /**
@@ -513,7 +789,7 @@ export function Marginalia({
   titleOf,
   markControls,
 }: MarginaliaProps) {
-  const [filter, setFilter] = useState<KindFilter>('All')
+  const [kind, setFilter] = useState<KindFilter>('All')
   /* ALL BOOKS BY DEFAULT, which is what this panel has always shown. Narrowing
      is the reader's move, and defaulting to it would silently change what a
      panel they already know shows them. */
@@ -572,6 +848,42 @@ export function Marginalia({
   )
 
   /**
+   * The note this panel last wrote on a mark, until the list catches up with it.
+   *
+   * ⚠️ **A CARD MADE STRAIGHT AFTER A NOTE CARRIED THE NOTE BEFORE IT** (#128).
+   * The pointer going down on "Make a card" blurs the editor, which saves — but
+   * a mark in another book is republished only once its file is written, so the
+   * click that follows read the row's old note. A card takes what was written
+   * here for as long as the row still shows a note `behind` it: the one it was
+   * written over, or one of this panel's own earlier saves on its way back.
+   * Once the row shows anything else — the note itself, or one written
+   * elsewhere since — the row is the answer, and the entry goes.
+   */
+  const written = useRef(new Map<string, { readonly note: string; readonly behind: ReadonlySet<string> }>())
+  /* THE WRITE IS HANDED BACK to the editor, which is holding the only copy of
+     the text until it lands — see `NoteEditor.onCommit` and `MarksView.setNote`
+     (#131). `void` for a session that cannot write, which is the same session
+     that draws no editor at all. */
+  const writeNote = (mark: Annotation, note: string): void | Promise<void> => {
+    const shows = mark.note.trim()
+    const was = written.current.get(mark.id)
+    const behind = was !== undefined && was.behind.has(shows) ? [...was.behind, was.note] : [shows]
+    written.current.set(mark.id, { note, behind: new Set(behind) })
+    // Stryker disable next-line OptionalChaining: the only caller is the note editor, which is drawn only when `setNote` is present.
+    return marks.setNote?.(mark, note)
+  }
+  const noteAsWritten = (mark: Annotation): Annotation => {
+    const kept = written.current.get(mark.id)
+    return kept !== undefined && kept.behind.has(mark.note.trim()) ? { ...mark, note: kept.note } : mark
+  }
+  useEffect(() => {
+    for (const [id, kept] of written.current) {
+      const mark = everything.find((one) => one.id === id)
+      if (mark === undefined || !kept.behind.has(mark.note.trim())) written.current.delete(id)
+    }
+  }, [everything])
+
+  /**
    * The open book's rows first, then the rest, each book in BOOK ORDER.
    *
    * The open book leads because `marks.all` is every book's in store order, so
@@ -598,19 +910,23 @@ export function Marginalia({
   )
 
   const shown = useMemo(() => {
-    const kept = inScope.filter((mark) => matches(mark, filter))
+    const kept = inScope.filter((mark) => matches(mark, kind))
     const byBook = new Map<string, Mark[]>()
     for (const mark of kept) {
       const group = byBook.get(mark.bookId)
       if (group) group.push(mark)
       else byBook.set(mark.bookId, [mark])
     }
-    const books = [...byBook.keys()].sort((a, b) =>
-      a === bookId ? -1 : b === bookId ? 1 : 0,
-    )
+    /* A PARTITION, NOT A SORT: the open book's group, then the rest in the
+       order they were met. This was a comparator, and its second half — "after"
+       when the open book is on the right — was one the sort never needed: a
+       sort asks only whether the left side goes first, so returning 1 or 0
+       there ordered every list alike (measured over lists of 1 to 300 books). */
+    const groups = [...byBook.entries()]
+    const books = [...groups.filter(([id]) => id === bookId), ...groups.filter(([id]) => id !== bookId)]
     // Each group is an array built here, so sorting it mutates nothing shared.
-    return books.flatMap((id) => (byBook.get(id) ?? []).sort(compareMarks))
-  }, [inScope, filter, bookId])
+    return books.flatMap(([, group]) => group.sort(compareMarks))
+  }, [inScope, kind, bookId])
 
   /* Reveal whatever was asked for — ONCE per request.
    *
@@ -646,12 +962,13 @@ export function Marginalia({
     if (!target) return
     honoured.current = focus.nonce
     setRevealed(focus.id)
-    if (!matches(target, filter)) setFilter('All')
+    if (!matches(target, kind)) setFilter('All')
     /* AND THE SCOPE, on the same reasoning as the kind filter: a request for
        a mark in ANOTHER book, arriving while the panel was scoped to this
        one, was marked honoured with its row hidden — a click that did
-       nothing, again. */
-    if (scope === 'This book' && bookId && target.bookId !== bookId) setScope('All books')
+       nothing, again. Not asked whether the scope IS narrowed: widening All
+       books to All books changes nothing, so that question decided nothing. */
+    if (bookId && target.bookId !== bookId) setScope('All books')
     if (focus.edit) setEditing(focus.id)
     /* After paint, so the row exists to scroll to when the filter just
        changed. Not cancelled when the deps change — a later republish would
@@ -662,9 +979,10 @@ export function Marginalia({
       rows.current.get(focus.id)?.scrollIntoView({ block: 'nearest' })
     })
     onFocusDone?.(focus.nonce)
-    // `filter` is deliberately absent: this reacts to a focus request, not to
+    // `kind` is deliberately absent: this reacts to a focus request, not to
     // the reader changing the filter themselves afterwards.
-  }, [focus, everything, onFocusDone, scope, bookId])
+  }, [focus, everything, onFocusDone, bookId])
+  // Stryker disable next-line ArrowFunction,ArrayDeclaration,CallExpression: a frame left running past unmount finds its row already let go of and scrolls nothing — the cancel, and the effect that holds it, only spare the frame.
   useEffect(() => () => cancelAnimationFrame(frame.current), [])
 
   /* Counted from what exists rather than written as prose: the fixture said
@@ -689,9 +1007,10 @@ export function Marginalia({
      book switched away, the row unmounts without a blur, and an id kept
      here would reopen the editor by itself the moment the row came back. */
   useEffect(() => {
-    if (editing !== null && !inScope.some((mark) => mark.id === editing && matches(mark, filter))) setEditing(null)
-  }, [editing, inScope, filter])
+    if (editing !== null && !inScope.some((mark) => mark.id === editing && matches(mark, kind))) setEditing(null)
+  }, [editing, inScope, kind])
 
+  /* NOTHING AT ALL. */
   if (everything.length === 0) {
     /* NOT YET AN ANSWER. The cross-book scan costs a read per book and the
        panel mounts before it lands, so "Nothing kept yet" stood over a
@@ -700,7 +1019,7 @@ export function Marginalia({
     if (marks.scanning) {
       return (
         <div className={styles.empty}>
-          <div className={styles.emptyBody}>Reading your marks…</div>
+          <div className={styles.emptyBody}>{SCANNING_MARKS}</div>
         </div>
       )
     }
@@ -712,7 +1031,7 @@ export function Marginalia({
       return (
         <div className={styles.empty}>
           <div className={styles.emptyTitle}>{SCAN_FAILED_MARKS}</div>
-          <div className={styles.emptyBody}>Nothing on disk has been changed. Close and reopen the panel to try again.</div>
+          <div className={styles.emptyBody}>{SCAN_FAILED_NEXT}</div>
         </div>
       )
     }
@@ -732,7 +1051,7 @@ export function Marginalia({
             <div className={styles.emptyTitle}>Nothing kept yet</div>
             <div className={styles.emptyBody}>
               Select a passage and choose Mark — notes you write on a mark appear
-              beside the line they belong to. Press {/* Stryker disable next-line StringLiteral: copy */ comboFor('⌘B', platform)} to
+              beside the line they belong to. Press {comboFor('⌘B', platform)} to
               keep the place you are reading.
             </div>
           </>
@@ -768,16 +1087,41 @@ export function Marginalia({
         </div>
       )}
 
+      {/* THE SCAN, SAID ABOVE WHAT IS LISTED AS WELL AS OVER NOTHING (#129,
+          #130). Kept to the nothing-at-all branch, a running scan let a partial
+          list pass for the whole of it. Running wins over failed, as it does in
+          that branch: a scan under way is the newer answer. */}
+      {marks.scanning && (
+        <div className={styles.panelMeta}>
+          <span>{SCANNING_MARKS}</span>
+        </div>
+      )}
+      {marks.scanFailed && !marks.scanning && (
+        <div className={styles.panelMeta}>
+          <span>
+            {SCAN_FAILED_MARKS}. {SCAN_FAILED_NEXT}
+          </span>
+        </div>
+      )}
+
+      {/* HERE, because this is where cards are made, above the rows that make
+          them (#122, #132). */}
+      {cards !== undefined && !cards.persistent && (
+        <div className={styles.panelMeta}>
+          <span>{NOT_SAVING_CARDS}</span>
+        </div>
+      )}
+
       {/* BOTH AXES ON ONE LINE, with a rule between them.
-          As words the seven wrapped to three lines of chrome above the list at
+          As words the chips wrapped to three lines of chrome above the list at
           the pane's 400px. As icons they are one, and the rule is what keeps
-          them legible as two questions rather than one row of seven — a reader
-          has to be able to see that picking "Notes" does not un-pick "This
+          them legible as two questions rather than one long row — a reader has
+          to be able to see that picking "Notes" does not un-pick "This
           book". */}
       <div className={styles.filterBar}>
         <FilterChips
           options={KINDS}
-          active={filter}
+          active={kind}
           onSelect={setFilter}
           label="Filter by kind"
           icons={KIND_ICONS}
@@ -800,12 +1144,15 @@ export function Marginalia({
         )}
       </div>
 
-      {shown.length === 0 && (
+      {/* NOT WHILE THE LIST IS UNFINISHED OR UNREAD — the line above says which,
+          and "No notes yet." under it would claim an answer nobody has yet
+          (#129, #130). */}
+      {shown.length === 0 && !marks.scanning && !marks.scanFailed && (
         <div className={styles.empty}>
           <div className={styles.emptyBody}>
             {/* Says which filter is empty, and which scope. A blank panel under
                 two selected chips reads as the marks having been lost. */}
-            No {filter === 'All' ? 'marginalia' : filter.toLowerCase()}
+            No {kind === 'All' ? 'marginalia' : kind.toLowerCase()}
             {scope === 'This book' ? ' in this book' : ''} yet.
           </div>
         </div>
@@ -814,9 +1161,15 @@ export function Marginalia({
       {shown.map((mark) => (
         <div
           key={mark.id}
-          ref={(node) => {
-            if (node) rows.current.set(mark.id, node)
-            else rows.current.delete(mark.id)
+          /* A CLEANUP, NOT A NULL: a ref that returns one is handed the element
+             and never `null` — React calls the cleanup when the row goes. Under
+             `if (node)`, storing the null handed in on the way out read exactly
+             like forgetting the row, so that test decided nothing. */
+          ref={(node: HTMLDivElement) => {
+            rows.current.set(mark.id, node)
+            return () => {
+              rows.current.delete(mark.id)
+            }
           }}
           className={styles.note}
           data-kind={mark.kind}
@@ -848,33 +1201,15 @@ export function Marginalia({
               Asking `isAnnotation` first narrows the branch that needs it. */}
           {isAnnotation(mark) ? (
           <>
-          {mark.kind === 'companion' && (
-            // The kind is stated as data as well as text: the amber that means
-            // "the companion wrote this" is keyed on it — see `.noteKind`.
-            <div className={styles.noteKind} data-kind="Companion">
-              Companion
-            </div>
-          )}
-
-          <button
-            type="button"
-            className={styles.noteJump}
-            /* A control that silently does nothing is worse than none — the
-               rule stands; its subject narrowed. It used to be "only the open
-               book", because a mark from another book had nowhere to jump to.
-               There is somewhere now: the host opens that book AT the mark and
-               ⌘[ brings the reader home. What is still unreachable is a book
-               that has left the shelf, and those rows are still disabled. */
-            disabled={!reachable(mark) || !onGoTo}
-            /* SAYS WHY, when the reason is not the obvious one. A row for a
-               book that has left the shelf explains itself — the book is gone.
-               An unplaced mark's book is right there and open, so a control
-               that does nothing looks like a defect unless it says otherwise. */
-            {...(mark.unplaced ? { title: UNPLACED_TITLE, 'aria-description': UNPLACED_TITLE } : {})}
-            onClick={() => onGoTo?.({ bookId: mark.bookId, cfi: mark.cfi })}
-          >
+          {/* A control that silently does nothing is worse than none — the
+              rule stands; its subject narrowed. It used to be "only the open
+              book", because a mark from another book had nowhere to jump to.
+              There is somewhere now: the host opens that book AT the mark and
+              ⌘[ brings the reader home. What is still unreachable is a book
+              that has left the shelf, and those rows are still disabled. */}
+          <JumpButton mark={mark} reachable={reachable(mark)} onGoTo={onGoTo}>
             <span className={styles.noteBody}>{mark.text}</span>
-          </button>
+          </JumpButton>
 
           {/* WITHOUT `setNote` THE NOTE IS TEXT, not a control. Offering the
               editor to a session that cannot write means the reader types a
@@ -887,9 +1222,11 @@ export function Marginalia({
           ) : editing === mark.id ? (
             <NoteEditor
               initial={mark.note}
+              /* A REFUSED DRAFT IS WHERE IT STARTS — see `MarksView.unsaved`. */
+              unsaved={marks.unsaved?.get(mark.id)}
               /* THE MARK, not its id — this list is cross-book, and a note
                  edited on another book's row was written to the open one. */
-              onCommit={(value) => marks.setNote?.(mark, value)}
+              onCommit={(value) => writeNote(mark, value)}
               onDone={() => setEditing(null)}
             />
           ) : (
@@ -898,7 +1235,10 @@ export function Marginalia({
               className={styles.noteComment}
               onClick={() => setEditing(mark.id)}
             >
-              {hasNote(mark) ? mark.note.trim() : 'Add a note'}
+              {/* A REFUSED DRAFT IS OFFERED, AND SAID TO BE ONE, ahead of the
+                  row's note — which for the open book may already read the
+                  same, drawn by the store before the write that failed. */}
+              {unsavedLabel(marks.unsaved?.get(mark.id)) ?? (hasNote(mark) ? mark.note.trim() : 'Add a note')}
             </button>
           )}
 
@@ -907,19 +1247,13 @@ export function Marginalia({
               is the capability's own, narrowed by `renderContribution` the
               way a contributed pane is; the kernel supplies the mark and
               never learns what the control does. */}
-          {/* ⚠️ THE READER'S OWN HIGHLIGHTS ONLY. A companion annotation is a
-              claim somebody else's model made about the text, and a control
-              that shares "what I marked" must not be offered on it as though
-              the reader had. */}
-          {isHighlight(mark)
-            ? markControls?.map((control) => (
-                <div key={control.id} data-mark-control={control.id}>
-                  <ContributionBoundary label="A mark control" id={control.id} resetKey={control.id}>
-                    <ContributionBody id={control.id} render={() => control.render(mark)} context={controlContext(bookId)} />
-                  </ContributionBoundary>
-                </div>
-              ))
-            : null}
+          {markControls?.map((control) => (
+            <div key={control.id} data-mark-control={control.id}>
+              <ContributionBoundary label="A mark control" id={control.id} resetKey={control.id}>
+                <ContributionBody id={control.id} render={() => control.render(mark)} context={controlContext(bookId)} />
+              </ContributionBoundary>
+            </div>
+          ))}
 
           <div className={styles.noteSource}>
             <span>{mark.chapter || 'Unknown chapter'}</span>
@@ -933,7 +1267,8 @@ export function Marginalia({
                   className={styles.noteDelete}
                   aria-label="Make a card"
                   title="Make a card"
-                  onClick={() => cards.make(cardFromMark(mark))}
+                  /* THE NOTE AS WRITTEN HERE, not as the row last heard it — see `written` (#128). */
+                  onClick={() => cards.make(cardFromMark(noteAsWritten(mark)))}
                 >
                   <Layers size={ICON.inline} strokeWidth={ICON.stroke} />
                 </button>

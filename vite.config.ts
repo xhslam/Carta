@@ -318,11 +318,15 @@ const MOBILE_HTML = 'index.mobile.html'
 const host = process.env.TAURI_DEV_HOST
 
 export default defineConfig({
-  // `cartaComposition()` resolves `virtual:carta-composition` (imported by
-  // src/main.tsx) to this build's platform composition from
-  // `TAURI_ENV_PLATFORM`, and at `generateBundle` fails the build unless the
-  // bundle holds exactly that platform's manifest set — the WI-5.9 assertion,
-  // inside the build. See scripts/vite/assert-bundle.mjs.
+  // `cartaComposition()` resolves `virtual:carta-composition` to this build's
+  // platform composition from `TAURI_ENV_PLATFORM`, and at `generateBundle`
+  // fails the build unless the bundle holds exactly that platform's manifest
+  // set — the WI-5.9 assertion, inside the build. See
+  // scripts/vite/assert-bundle.mjs.
+  //
+  // ⚠️ IMPORTED BY `src/app/bootApp.ts` AND `src/main.web.tsx` — this said
+  // `src/main.tsx`, which imports it only through `bootApp()` and is one of
+  // three entries (2026-09-19 audit). Grep before naming an importer here.
   //
   // `timingLog()` is dev-only (`apply: 'serve'`) and puts the launch timings
   // `kernel/ui/devTiming` sends over the HMR socket into THIS terminal.

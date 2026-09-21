@@ -247,22 +247,6 @@
     ]
   },
   {
-    "name": "aws-lc-rs",
-    "version": "1.18.0",
-    "license": "ISC AND (Apache-2.0 OR ISC)",
-    "texts": [
-      "efbbbcefb4b8"
-    ]
-  },
-  {
-    "name": "aws-lc-sys",
-    "version": "0.44.0",
-    "license": "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)",
-    "texts": [
-      "49f5cc2a2e4d"
-    ]
-  },
-  {
     "name": "axum",
     "version": "0.8.9",
     "license": "MIT",
@@ -415,6 +399,15 @@
     ]
   },
   {
+    "name": "block-padding",
+    "version": "0.3.3",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "e8541ea93f02",
+      "5ff5253f2cb9"
+    ]
+  },
+  {
     "name": "block2",
     "version": "0.5.1",
     "license": "MIT",
@@ -549,6 +542,15 @@
     "license": "MIT",
     "texts": [
       "30fefc3a7d6a"
+    ]
+  },
+  {
+    "name": "cbc",
+    "version": "0.1.2",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "e8541ea93f02",
+      "f3bd9e2e7745"
     ]
   },
   {
@@ -1211,16 +1213,6 @@
     ]
   },
   {
-    "name": "encoding_rs",
-    "version": "0.8.35",
-    "license": "(Apache-2.0 OR MIT) AND BSD-3-Clause",
-    "texts": [
-      "283ea6cc2997",
-      "7dc2f6402447",
-      "b1d6d97b0476"
-    ]
-  },
-  {
     "name": "endi",
     "version": "1.1.1",
     "license": "MIT",
@@ -1767,6 +1759,24 @@
     "texts": [
       "7c6e3dde6898",
       "5319364eff99"
+    ]
+  },
+  {
+    "name": "hkdf",
+    "version": "0.12.4",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "e8541ea93f02",
+      "2ab57d98da83"
+    ]
+  },
+  {
+    "name": "hmac",
+    "version": "0.12.1",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "e8541ea93f02",
+      "9c5127ab88e8"
     ]
   },
   {
@@ -2510,6 +2520,14 @@
     ]
   },
   {
+    "name": "nix",
+    "version": "0.29.0",
+    "license": "MIT",
+    "texts": [
+      "b9b039b5058c"
+    ]
+  },
+  {
     "name": "noq",
     "version": "1.1.1",
     "license": "MIT OR Apache-2.0",
@@ -2537,12 +2555,66 @@
     ]
   },
   {
+    "name": "num",
+    "version": "0.4.3",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "954f335b8baf",
+      "14435fbcd271"
+    ]
+  },
+  {
+    "name": "num-bigint",
+    "version": "0.4.8",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "954f335b8baf",
+      "14435fbcd271"
+    ]
+  },
+  {
+    "name": "num-complex",
+    "version": "0.4.6",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "954f335b8baf",
+      "14435fbcd271"
+    ]
+  },
+  {
     "name": "num-conv",
     "version": "0.2.2",
     "license": "MIT OR Apache-2.0",
     "texts": [
       "4bf96504d6e8",
       "4d83b119f786"
+    ]
+  },
+  {
+    "name": "num-integer",
+    "version": "0.1.47",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "954f335b8baf",
+      "14435fbcd271"
+    ]
+  },
+  {
+    "name": "num-iter",
+    "version": "0.1.46",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "954f335b8baf",
+      "14435fbcd271"
+    ]
+  },
+  {
+    "name": "num-rational",
+    "version": "0.4.2",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "954f335b8baf",
+      "14435fbcd271"
     ]
   },
   {
@@ -3291,33 +3363,6 @@
     ]
   },
   {
-    "name": "quinn",
-    "version": "0.11.11",
-    "license": "MIT OR Apache-2.0",
-    "texts": [
-      "283ea6cc2997",
-      "05fa1ba3228a"
-    ]
-  },
-  {
-    "name": "quinn-proto",
-    "version": "0.11.17",
-    "license": "MIT OR Apache-2.0",
-    "texts": [
-      "283ea6cc2997",
-      "05fa1ba3228a"
-    ]
-  },
-  {
-    "name": "quinn-udp",
-    "version": "0.5.15",
-    "license": "MIT OR Apache-2.0",
-    "texts": [
-      "283ea6cc2997",
-      "05fa1ba3228a"
-    ]
-  },
-  {
     "name": "quote",
     "version": "1.0.47",
     "license": "MIT OR Apache-2.0",
@@ -3337,10 +3382,28 @@
   },
   {
     "name": "rand",
+    "version": "0.8.8",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "fee4d7ce394c",
+      "cc367a7134c2"
+    ]
+  },
+  {
+    "name": "rand",
     "version": "0.9.5",
     "license": "MIT OR Apache-2.0",
     "texts": [
       "fee4d7ce394c",
+      "cc367a7134c2"
+    ]
+  },
+  {
+    "name": "rand_chacha",
+    "version": "0.3.1",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "e7330bf53074",
       "cc367a7134c2"
     ]
   },
@@ -3360,6 +3423,15 @@
     "texts": [
       "179c83ef07a5",
       "704f0e5f1c84"
+    ]
+  },
+  {
+    "name": "rand_core",
+    "version": "0.6.4",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "179c83ef07a5",
+      "cc367a7134c2"
     ]
   },
   {
@@ -3603,6 +3675,15 @@
     "texts": [
       "954f335b8baf",
       "1a6aa2616e74"
+    ]
+  },
+  {
+    "name": "secret-service",
+    "version": "4.0.0",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "954f335b8baf",
+      "cef8c2ddacb4"
     ]
   },
   {
@@ -3992,6 +4073,15 @@
     "texts": [
       "954f335b8baf",
       "5e05b024f653"
+    ]
+  },
+  {
+    "name": "static_assertions",
+    "version": "1.1.0",
+    "license": "MIT OR Apache-2.0",
+    "texts": [
+      "283ea6cc2997",
+      "95a6a71a30f3"
     ]
   },
   {
@@ -5180,6 +5270,14 @@
     ]
   },
   {
+    "name": "xdg-home",
+    "version": "1.3.0",
+    "license": "MIT",
+    "texts": [
+      "30fefc3a7d6a"
+    ]
+  },
+  {
     "name": "xml-rs",
     "version": "0.8.29",
     "license": "MIT",
@@ -5213,7 +5311,23 @@
   },
   {
     "name": "zbus",
+    "version": "4.4.0",
+    "license": "MIT",
+    "texts": [
+      "a0e7d0739e03"
+    ]
+  },
+  {
+    "name": "zbus",
     "version": "5.19.0",
+    "license": "MIT",
+    "texts": [
+      "a0e7d0739e03"
+    ]
+  },
+  {
+    "name": "zbus_macros",
+    "version": "4.4.0",
     "license": "MIT",
     "texts": [
       "a0e7d0739e03"
@@ -5225,6 +5339,14 @@
     "license": "MIT",
     "texts": [
       "a0e7d0739e03"
+    ]
+  },
+  {
+    "name": "zbus_names",
+    "version": "3.0.0",
+    "license": "MIT",
+    "texts": [
+      "30fefc3a7d6a"
     ]
   },
   {
@@ -5341,7 +5463,23 @@
   },
   {
     "name": "zvariant",
+    "version": "4.2.0",
+    "license": "MIT",
+    "texts": [
+      "a0e7d0739e03"
+    ]
+  },
+  {
+    "name": "zvariant",
     "version": "5.15.0",
+    "license": "MIT",
+    "texts": [
+      "a0e7d0739e03"
+    ]
+  },
+  {
+    "name": "zvariant_derive",
+    "version": "4.2.0",
     "license": "MIT",
     "texts": [
       "a0e7d0739e03"
@@ -5353,6 +5491,14 @@
     "license": "MIT",
     "texts": [
       "a0e7d0739e03"
+    ]
+  },
+  {
+    "name": "zvariant_utils",
+    "version": "2.1.0",
+    "license": "MIT",
+    "texts": [
+      "30fefc3a7d6a"
     ]
   },
   {

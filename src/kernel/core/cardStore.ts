@@ -1,3 +1,4 @@
+import { notifyAll } from './notify'
 import { CARDS_STORAGE_KEY, addCard, byNewest, liveCards, parseCards, removeCard, type Card, type NewCard } from './cards'
 import { hlcOf, type Hlc } from './hlc'
 import { rekeyBook } from './idMigration'
@@ -125,6 +126,7 @@ export function createCard(draft: NewCard): Card {
 export function createCards({
   storage,
   recorder = NOOP_RECORDER,
+  // Stryker disable next-line ArrowFunction: `remove` is the only reader, and `removeCard`'s own default stamps `undefined` with this same `hlcOf(Date.now())`.
   clock = () => hlcOf(Date.now()),
   queue,
 }: CardsOptions): Cards {
@@ -133,8 +135,16 @@ export function createCards({
    * is NOT an empty collection: writing "empty plus this edit" over bytes
    * that were merely unreadable this launch would be data loss, so a load
    * failure makes the store SESSION-ONLY — it never writes, and `persistent`
-   * says so from the first snapshot (as it does with no storage at all). */
-  let all: readonly Card[] = []
+   * says so from the first snapshot (as it does with no storage at all).
+   *
+   * ⚠️ **AND BYTES THAT WILL NOT PARSE ARE A LOAD FAILURE TOO — THEY USED TO BE
+   * AN EMPTY COLLECTION.** `parseCards` answered `[]` for them, so only a
+   * storage that THREW took the path this comment describes, and a corrupt
+   * card file took the other one: healthy, empty, and replaced by the next
+   * card made (2026-09-13 audit). It throws now, so both arrive here. */
+  /* No initial value: both paths below assign one, and an `= []` here was
+   * never read by anything. */
+  let all: readonly Card[]
   let unloadable = false
   try {
     all = storage ? byNewest(parseCards(storage.getItem(CARDS_STORAGE_KEY))) : []
@@ -150,15 +160,9 @@ export function createCards({
   let snapshot: CardSnapshot = { all: liveCards(all), persistent }
   const publish = () => {
     snapshot = { all: liveCards(all), persistent }
-    for (const listener of [...listeners]) {
-      /* Isolated: a throwing subscriber must not stop later listeners, nor —
-       * mid-mutation — abort the persist that follows this notification. */
-      try {
-        listener()
-      } catch {
-        /* A listener's failure is its own; the store's write still happens. */
-      }
-    }
+    /* Isolated: a throwing subscriber must not stop later listeners, nor —
+     * mid-mutation — abort the persist that follows this notification. */
+    notifyAll(listeners, 'cards')
   }
 
   /**

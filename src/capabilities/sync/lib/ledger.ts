@@ -130,6 +130,8 @@ export interface LedgerOptions {
    * contained — the contract above is unchanged.
    */
   readonly onArrived?: (bookId: string, peerId: string) => void | Promise<void>
+  /** Called only after a satchel's hello passes every protocol/readiness check. */
+  readonly onServed?: (peer: string) => void
 }
 
 export interface SyncSummary {
@@ -306,6 +308,7 @@ export function createLedger({
   hashFile,
   pageLimit = DEFAULT_PAGE_LIMIT,
   onArrived,
+  onServed,
 }: LedgerOptions): Ledger {
   if (!Number.isInteger(pageLimit) || pageLimit < 1) {
     throw new Error(`createLedger: pageLimit must be a positive integer, not ${JSON.stringify(pageLimit)}`)
@@ -640,7 +643,7 @@ export function createLedger({
     return epoch
   }
 
-  const handleHello = async (raw: unknown): Promise<unknown> => {
+  const handleHello = async (raw: unknown, peer: string): Promise<unknown> => {
     const hello = parseSyncHello(raw)
     if (hello === null) throw refuse('malformed', 'not a sync hello')
     if (hello.proto !== SYNC_PROTO) throw refuse('unsupported', `proto ${hello.proto} is not ${SYNC_PROTO}`)
@@ -653,6 +656,7 @@ export function createLedger({
     if (hello.role !== 'satchel') throw refuse('unsupported', `a ${role} serves satchels, not another ${hello.role}`)
     const epoch = requireReady()
     clock.witness(hello.clock)
+    onServed?.(peer)
     return {
       clock: clock.now(),
       epoch,
@@ -1423,7 +1427,7 @@ export function createLedger({
 
   return {
     services: () => [
-      { name: SYNC_SERVICES.hello.name, grant: SYNC_SERVICES.hello.grant, handler: (req) => handleHello(req) },
+      { name: SYNC_SERVICES.hello.name, grant: SYNC_SERVICES.hello.grant, handler: (req, ctx) => handleHello(req, ctx.peer) },
       { name: SYNC_SERVICES.push.name, grant: SYNC_SERVICES.push.grant, handler: (req, ctx) => handlePush(req, ctx.peer) },
       { name: SYNC_SERVICES.pull.name, grant: SYNC_SERVICES.pull.grant, handler: (req) => handlePull(req) },
       { name: SYNC_SERVICES.marks.name, grant: SYNC_SERVICES.marks.grant, handler: (req) => handleMarks(req) },

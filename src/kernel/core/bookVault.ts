@@ -257,3 +257,10 @@ export async function readOwnedBook(
    * shows it when a book declares no title, and neither wants a hash. */
   return new File([bytes as BlobPart], name)
 }
+
+/** Distinguish an absent file from an unreadable one; callers fail loud on an
+ * unknown error so a transient read failure can never be treated as empty. */
+export function isMissingFile(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : String(cause)
+  return /not found|no such file|ENOENT/iu.test(message)
+}

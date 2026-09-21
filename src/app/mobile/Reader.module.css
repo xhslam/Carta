@@ -511,7 +511,7 @@
 
 .markQuote {
   font-size: var(--text-ui);
-  line-height: 1.45;
+  line-height: var(--leading-ui);
   color: var(--ink);
   border-left: 3px solid var(--accent);
   padding-left: var(--space-8);
@@ -539,7 +539,7 @@
 
 .emptyNoticeText {
   font-size: var(--text-ui);
-  line-height: 1.5;
+  line-height: var(--leading-body);
 }
 
 /* ── Mobile Appearance & Typography Sheet ────────────────────────────────── */
@@ -831,7 +831,7 @@
 
 .noteSheetQuote {
   font-size: var(--text-small);
-  line-height: 1.45;
+  line-height: var(--leading-ui);
   color: var(--ink);
   border-left: var(--track-w) solid var(--accent);
   padding-left: var(--space-8);
@@ -849,7 +849,7 @@
   background: var(--surface);
   color: var(--ink);
   font-size: var(--text-ui);
-  line-height: 1.5;
+  line-height: var(--leading-body);
   resize: none;
   outline: none;
   font-family: inherit;

@@ -12,7 +12,14 @@ import {
 } from '../../core/metrics'
 import { PANE_TITLES, THEMES } from '../panes'
 
-/* A settings section is about no book. Stryker disable next-line ObjectLiteral: no section reads the context, so what it holds cannot be seen. */
+/* A settings section is about no book — no section reads the context, so what
+   it holds cannot be seen.
+
+   ⚠️ THIS COMMENT CARRIED A `Stryker disable next-line ObjectLiteral` AND IT
+   DISABLED NOTHING: a directive is read only where the comment BEGINS with it,
+   and there is no mutant here to disable anyway, because `as const` is what
+   stops Stryker mutating the literal. Measured both ways — 268 mutants with the
+   directive and without it, 269 with `as const` removed. */
 const NO_BOOK = { bookId: null } as const
 import type { Face } from '../../core/typefaces'
 import { FacePicker } from './FacePicker'
@@ -20,7 +27,7 @@ import type {
   Align,
   PageLayout,
   ReadingStyle,
-  ReadingStyleKey,
+  ReadingStyleArgs,
   Side,
   SpacingIndices,
   SpacingKey,
@@ -42,6 +49,7 @@ import {
   SIDES,
   TABLE_FITS,
   UNFINISHED_PANE_IDS,
+  settingsSectionOffered,
 } from '../../core/uiTypes'
 import { PaneBand } from './PaneBand'
 import { PaneGroup } from './PaneGroup'
@@ -57,8 +65,9 @@ import { uiText, useUiLanguage } from '../i18n'
  */
 
 /**
- * §05 theme chips — the page colour of each theme, as a literal, because a
- * swatch has to show the theme it offers rather than the one in use.
+ * §05 theme chips — each theme drawn in itself, because a swatch has to show
+ * the theme it offers rather than the one in use. This line said "the page
+ * colour of each theme, as a literal", which the paragraph below ended (#144).
  *
  * THE SWATCHES CARRY `data-theme` AND ARE DRAWN IN IT. There was a table of
  * one hex per theme here, which is a copy of a value `tokens.css` already
@@ -193,8 +202,8 @@ export interface SettingsProps {
    * ⚠️ THE SEVEN OPTIONAL SETTERS BELOW, and why absence is the right signal.
    *
    * A host that cannot do the thing does not pass its setter, and the row is
-   * not drawn — the same convention as `onAddBooks` on the shelf, `cards` in
-   * Marginalia and `onInstallGloss` in the reader. The browser client mounts
+   * not drawn — the same convention as `onAddBooks` on the shelf and `cards` in
+   * Marginalia. The browser client mounts
    * this pane and has no reading ruler, no scroll port it owns, no side pane
    * (a 393px screen has no side), and no brightness or contrast filter; drawing
    * those rows would name features that host will never have.
@@ -215,7 +224,9 @@ export interface SettingsProps {
   onAlign: (align: Align) => void
   /** WI-14.4's fifteen — see `ReadingStyle`. */
   style: ReadingStyle
-  onStyle: <K extends ReadingStyleKey>(key: K, value: ReadingStyle[K]) => void
+  /* THE CORRELATED PAIR, not a generic: see `ReadingStyleArgs` for the hole a
+     generic `K` left open here as well as in `setReadingStyle` (#212). */
+  onStyle: (...args: ReadingStyleArgs) => void
   brightness?: number | undefined
   onBrightness?: ((idx: number) => void) | undefined
   contrast?: number | undefined
@@ -317,7 +328,15 @@ function CycleRow<T extends string>({
   )
 }
 
-/** The same row for a setting that is simply on or off. */
+/**
+ * The same row for a setting that is simply on or off.
+ *
+ * ⚠️ **A SWITCH, AND IT WAS A PLAIN BUTTON** (#140). Its text flipped between
+ * "On" and "Off", so assistive technology heard a different button on every
+ * press and no state at all. `aria-checked` says the state, and the name is
+ * the label alone so it does not change under the reader's finger; the value
+ * stays on screen for the readers who read it there.
+ */
 function ToggleRow({
   label,
   on,
@@ -332,7 +351,14 @@ function ToggleRow({
   const language = useUiLanguage()
   const shownLabels = labels ?? (language === 'zh' ? { on: '开启', off: '关闭' } : { on: 'On', off: 'Off' })
   return (
-    <button type="button" className={styles.settingRow} onClick={() => onChange(!on)}>
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      aria-label={label}
+      className={styles.settingRow}
+      onClick={() => onChange(!on)}
+    >
       <span style={{ flex: 1 }}>{label}</span>
       <span className={styles.settingValue}>{on ? shownLabels.on : shownLabels.off}</span>
     </button>
@@ -381,6 +407,34 @@ export function Settings({
   const language = useUiLanguage()
   const t = (zh: string, en: string) => uiText(language, zh, en)
   const step = readingStep(stepIdx)
+  /* THE INDEX OF THE STEP SHOWN, which is not always the one handed in.
+     `readingStep` shows the default for an index off the scale, and the stepper
+     measured its ends from the raw index — so Larger was dead and Smaller asked
+     for a step that does not exist (#142). `StepRow` clamps for the same
+     reason. */
+  const stepAt = READING_STEPS.indexOf(step)
+  /* WHETHER PAGE HAS A ROW TO SHOW (#141). Each of its rows is gated on a
+     setter, and the ruler and the scrollbar on scrolled flow as well — so a
+     phone or a browser, passing none of those setters, drew a "Page" heading
+     that opened onto nothing. The rows' own conditions, and 'a container with
+     nothing in it' holds each of them to this. */
+  const pageRowsDrawn =
+    onPageLayout !== undefined ||
+    (pageLayout === 'scrolled' && (onToggleRuler !== undefined || onToggleScrollbar !== undefined)) ||
+    onToggleProgressLine !== undefined ||
+    onSide !== undefined
+  /* THE SECTIONS THIS READER IS OFFERED, decided before the band is: a band
+     whose every section was filtered away, with nothing missing, captioned
+     nothing at all (#141). See the band for why they are filtered.
+
+     `developer?.hidden` WITH NO `?? []`: absent, the list is
+     `settingsSectionOffered`'s own default — and it is absent only with
+     developer options off, where the list is never read, so a fallback here
+     could not be told from none. */
+  const offeredSections = sections.filter((section) =>
+    settingsSectionOffered(section, developer !== undefined, developer?.hidden),
+  )
+  const appBandDrawn = offeredSections.length > 0 || (missing ?? []).length > 0
   const [faceMenuOpen, setFaceMenuOpen] = useState(false)
   /* ONE MECHANISM FOR EVERY GROUP, the kernel's own and the contributed ones
      alike. There were three — a boolean for Light, a boolean for Spacing, and
@@ -395,6 +449,7 @@ export function Settings({
   const groupOpen = (id: string) => openGroups.includes(id)
   const toggleGroup = (id: string) =>
     setOpenGroups((open) => (open.includes(id) ? open.filter((one) => one !== id) : [...open, id]))
+
   /* Handed in, not probed here: `App` probes once and gives the same list to
      this panel and to the command palette, so the two cannot come to offer
      different faces. */
@@ -503,9 +558,9 @@ export function Settings({
           <button
             type="button"
             className={styles.stepperButton}
-            disabled={stepIdx <= 0}
-            aria-label={t('减小字号', 'Smaller text')}
-            onClick={() => onStepIdx(stepIdx - 1)}
+            disabled={stepAt <= 0}
+            aria-label="Smaller text"
+            onClick={() => onStepIdx(stepAt - 1)}
           >
             <span className={styles.stepperSmall} aria-hidden="true">
               A
@@ -519,9 +574,9 @@ export function Settings({
           <button
             type="button"
             className={styles.stepperButton}
-            disabled={stepIdx >= READING_STEPS.length - 1}
-            aria-label={t('增大字号', 'Larger text')}
-            onClick={() => onStepIdx(stepIdx + 1)}
+            disabled={stepAt >= READING_STEPS.length - 1}
+            aria-label="Larger text"
+            onClick={() => onStepIdx(stepAt + 1)}
           >
             <span className={styles.stepperLarge} aria-hidden="true">
               A
@@ -530,14 +585,6 @@ export function Settings({
         </div>
       </div>
 
-      {/* HOW OPEN THE TYPE IS SET. Four things, grouped, because a reader
-          adjusting one is usually adjusting the next — and separated from the
-          face and size above because those two decide what the page IS and
-          these decide how much air it has.
-
-          Nothing here touches the MEASURE. That is the size step's, and letting
-          a second control move it would make the line length depend on which
-          one was touched last. */}
       {/* ONE DECISION, NOT TWO — but three states rather than two. It was
           `justify` and `hyphenate`, two booleans and four combinations, of
           which one is simply worse and shipping it by accident was the reason
@@ -586,11 +633,17 @@ export function Settings({
       </PaneGroup>
 
       {/* THE FINE TUNING OF THE SAME TYPE, kept behind a click and kept next
-          to what it tunes. Four rows a reader sets once and then leaves for
-          months; open, they push everything below them off a 400px pane, and
-          that is the whole argument `PaneGroup` was built on. It sits
-          directly under Text rather than at the bottom of the panel so the
-          heading it refines is the one above it.
+          to what it tunes: the face and size above decide what the page IS,
+          and these decide how much air it has. Rows a reader sets once and
+          then leaves for months — the four spacings and the CJK gap; open,
+          they push everything below them off a 400px pane, and that is the
+          whole argument `PaneGroup` was built on. It sits directly under Text
+          rather than at the bottom of the panel so the heading it refines is
+          the one above it.
+
+          A copy of this note's opening, "Four things, grouped", stood above
+          Alignment inside Text, over none of the rows it counted (#144). What
+          only the copy said is the first sentence here.
 
           Nothing here touches the MEASURE. That is the size step's, and letting
           a second control move it would make the line length depend on which
@@ -772,6 +825,8 @@ export function Settings({
           either way, and the side pane is the furniture the page is set
           beside. One question — what does the reading surface look like and
           how does it advance — asked five ways. */}
+      {/* Only with a row to put in it — see `pageRowsDrawn`. */}
+      {pageRowsDrawn && (
       <PaneGroup
         title={t('页面', 'Page')}
         open={groupOpen(GROUP.page)}
@@ -828,6 +883,7 @@ export function Settings({
         <CycleRow label={t('侧栏位置', 'Side pane position')} states={SIDES} value={side} labels={language === 'zh' ? { left: '左侧', right: '右侧' } : SIDE_LABELS} onChange={onSide} />
       )}
       </PaneGroup>
+      )}
 
       </PaneBand>
 
@@ -846,20 +902,32 @@ export function Settings({
           a render, so a closed group never mounts the pane — which is what
           stops the Storage section reading the disk on every shelf write for
           a surface nobody has opened. */}
-      <PaneBand title={t('应用', 'The app')}>
-      {sections.map((section) => (
-        <PaneGroup
-          key={section.id}
-          title={section.title}
-          open={groupOpen(section.id)}
-          onToggle={() => toggleGroup(section.id)}
-        >
-          {/* The group mounts its body only while open — one gate, the group's — and a throw stops at the section. */}
-          <ContributionBoundary label={section.title} id={section.id} resetKey={section.id}>
-            <ContributionBody id={section.id} render={section.render} context={NO_BOOK} />
-          </ContributionBoundary>
-        </PaneGroup>
-      ))}
+      {/* Only with something to hold — see `appBandDrawn`. */}
+      {appBandDrawn && (
+      <PaneBand title="The app">
+      {/* ⚠️ **FILTERED, AND IT NEVER WAS.** `UNFINISHED_PANE_IDS` hid the
+          deleted companion's PANEL and left its settings section in front of
+          every reader — settings for a surface they cannot open. The rule is
+          derived from that one list rather than restated here; see
+          `settingsSectionOffered`, which also explains why a section is matched
+          on its OWN capability and never on one it depends on, and the one flag
+          a single section can carry instead — `unfinished`. Filtered above,
+          into `offeredSections`, so the band can ask first whether it holds
+          anything. */}
+      {offeredSections.map((section) => (
+          <PaneGroup
+            key={section.id}
+            title={section.title}
+            group={section.id}
+            open={groupOpen(section.id)}
+            onToggle={() => toggleGroup(section.id)}
+          >
+            {/* The group mounts its body only while open — one gate, the group's — and a throw stops at the section. */}
+            <ContributionBoundary label={section.title} id={section.id} resetKey={section.id}>
+              <ContributionBody id={section.id} render={section.render} context={NO_BOOK} />
+            </ContributionBoundary>
+          </PaneGroup>
+        ))}
 
       {/* INSIDE THE BAND, not after it. These name a capability that failed to
           start, so they belong with the capabilities' own sections — floating
@@ -872,6 +940,7 @@ export function Settings({
         </div>
       ))}
       </PaneBand>
+      )}
 
       {/* ⚠️ **THE BAND EXISTS ONLY WHILE DEVELOPER OPTIONS ARE ON**, and there
           is deliberately no control here that turns them on. ⌘⌃⌥D is the way

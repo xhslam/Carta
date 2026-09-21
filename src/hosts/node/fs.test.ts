@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve, win32 } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { CONTENT_EXTENSIONS } from '../../kernel'
-import { BOOKS_ONLY_BYTES, LIBRARY_FIXTURE, LIBRARY_FIXTURE_BYTES } from '../../kernel/testkit'
+import { BOOKS_ONLY_BYTES, LIBRARY_FIXTURE, LIBRARY_FIXTURE_BYTES, refusalOf } from '../../kernel/testkit'
 import { makeDataDir, nodeIndexFs, nodeSizePort, nodeTextFs, under } from './fs'
 
 /**
@@ -345,8 +345,14 @@ describe('nodeTextFs', () => {
      * name is private per write now, so the failure has to be induced
      * somewhere both writers would meet it. */
     await chmod(root, 0o555)
-    await expect(fs.write('carta.store.v1.json', '{"lost":true}')).rejects.toThrow()
-    await chmod(root, 0o755)
+    /* REOPENED WHATEVER THE ASSERTION SAYS, like its neighbours: a directory
+     * left unwritable cannot be emptied, so a failure here also failed
+     * `afterEach` and left the whole root behind. */
+    try {
+      expect((await refusalOf(fs.write('carta.store.v1.json', '{"lost":true}'))).code).toBe('EACCES')
+    } finally {
+      await chmod(root, 0o755)
+    }
     expect(await fs.read('carta.store.v1.json')).toBe('{"kept":true}')
     expect((await nodeIndexFs(root).readDir('')).map((one) => one.name)).toEqual(['carta.store.v1.json'])
   })
@@ -366,7 +372,12 @@ describe('nodeTextFs', () => {
      * succeed, and the write has already reached disk by then. */
     await nodeIndexFs(root).mkdir('carta.store.v1.json')
     await nodeIndexFs(root).writeFile('carta.store.v1.json/occupied', bytes('x'))
-    await expect(fs.write('carta.store.v1.json', '{"doomed":true}')).rejects.toThrow()
+    /* ⚠️ **WINDOWS REPORTS THIS RENAME AS `EPERM`, NOT `EISDIR`** — measured
+     * 2026-09-14 on Windows 11 with Node 24.19. It is the same failure through
+     * another errno, and `write` does not branch on the code, so what this
+     * pins — the cleanup — is the same on both. */
+    const refused = process.platform === 'win32' ? 'EPERM' : 'EISDIR'
+    expect((await refusalOf(fs.write('carta.store.v1.json', '{"doomed":true}'))).code, `the publish failed, and on a directory that is ${refused}`).toBe(refused)
     const names = (await nodeIndexFs(root).readDir('')).map((one) => one.name)
     expect(names).toEqual(['carta.store.v1.json'])
   })

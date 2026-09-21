@@ -1,7 +1,7 @@
 {
   "name": "carta-mobile",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
@@ -18,8 +18,8 @@
     "typecheck": "rm -rf .types && tsc -b && node scripts/check-kernel-declarations.mjs",
     "tauri": "tauri",
     "app": "pnpm android",
-    "ios": "tauri ios dev -- --no-default-features --features ios",
-    "android": "tauri android dev -- --no-default-features --features android",
+    "ios": "tauri ios dev --config src-tauri/tauri.dev.conf.json -- --no-default-features --features ios",
+    "android": "tauri android dev --config src-tauri/tauri.dev.conf.json -- --no-default-features --features android",
     "ios:build": "tauri ios build -- --no-default-features --features ios",
     "android:build": "tauri android build -- --no-default-features --features android",
     "test": "vitest run",
@@ -44,7 +44,6 @@
     "capability:remove": "node scripts/capability-remove.mjs",
     "verify": "node scripts/verify.mjs",
     "verify:without": "node scripts/verify-without.mjs",
-    "runtime:sync": "node scripts/sync-inference-runtime.mjs",
     "mutants": "node scripts/check-mutants.mjs"
   },
   "dependencies": {

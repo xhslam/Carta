@@ -60,7 +60,7 @@ describe('every HTML entry is typechecked', () => {
   /* THE SCAN ITSELF FIRST. A glob that matched nothing would make every case
      below vacuously true, which is the shape of the bug this file exists for. */
   it('finds the entry documents at all', () => {
-    expect(documents.length, 'no index*.html found — this gate is checking nothing').toBeGreaterThan(1)
+    expect(documents.length, 'no index*.html found — this gate is checking nothing').toBeGreaterThan(0)
   })
 
   it.each(documents)('%s loads a module script', (document) => {

@@ -167,6 +167,10 @@ export function scopeSettings(store: SettingsStore, capId: string): SettingsStor
       guard(setting.key)
       return store.get(setting)
     },
+    has: (setting) => {
+      guard(setting.key)
+      return store.has(setting)
+    },
     set: (setting, value) => {
       guard(setting.key)
       store.set(setting, value)
@@ -901,7 +905,12 @@ export async function composeCapabilities(
        * wrote it in the ordinary way. */
       screens: Object.freeze(
         (cap.screens ?? []).map((screen) =>
-          Object.freeze({ id: screen.id, label: screen.label, render: screen.render.bind(screen) }),
+          Object.freeze({
+            id: screen.id,
+            label: screen.label,
+            icon: screen.icon,
+            render: screen.render.bind(screen),
+          }),
         ),
       ),
       overlays: Object.freeze(

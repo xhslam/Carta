@@ -318,11 +318,12 @@ pub fn run() {
      *
      * `reqwest` is `rustls-no-provider` here, so rustls does not choose a
      * provider for itself: the process installs one or every `Client::new`
-     * panics. On desktop the local inference plugin supplies it; that plugin is
-     * `optional` precisely so it is not compiled for iOS and Android — and
+     * panics. The deleted inference plugin supplied it on desktop and was
+     * `optional` precisely so it was not compiled for iOS and Android — and
      * nothing took over the job it was also doing. iroh builds a client for its
      * relays on every platform, so the app panicked at launch on both mobile
-     * targets, every time.
+     * targets, every time. The install below is the app's own, which is why
+     * removing that plugin took nothing with it.
      *
      * Found by RUNNING it on the iOS simulator on 2026-08-30, the first time
      * this app had ever been launched on a phone. `mobile.yml` builds an
@@ -381,6 +382,63 @@ pub fn run() {
                     opened::deliver(app, opened::books_in_argv(argv, Some(&base)));
                 })
                 .dbus_id("one.carta.reader")
+                .build(),
+        );
+    }
+
+    /* ⚠️ **THE LOGGER, AND IT HAS TO BE HERE RATHER THAN IN `setup`.**
+     *
+     * It sat inside `.setup()` — first within it, which was already a fix: it
+     * had been below the lock block, the one place in `setup` that can refuse
+     * to start, so `log::error!("lock: …")` went nowhere on every platform and
+     * the one message saying why Carta would not open was lost. Measured on a
+     * Linux box: five lines against 193 on a clean start, no error among them,
+     * and a window that never painted.
+     *
+     * ⚠️ **BUT EVERY PLUGIN'S OWN `setup` RUNS BEFORE THE APP'S.** So being
+     * first inside `setup` is still after fs, dialog, persisted-scope,
+     * window-state, webhost and peer have each run theirs — and
+     * `tauri-plugin-webhost` `log::error!`s from inside its setup when it moves
+     * a corrupt `sessions.json` aside. The `log` crate discards records with no
+     * logger installed, so every phone was signed out and `Carta.log` carried
+     * no line saying why. Registered on the BUILDER, it is installed before any
+     * other plugin's setup can speak.
+     *
+     * After `single_instance` and nothing else: that one must stay first — see
+     * its note — and a second process that installs a logger and then exits
+     * costs nothing. */
+    if cfg!(debug_assertions) {
+        builder = builder.plugin(
+            tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Info)
+                /* ⚠️ **IROH LOGS ONE LINE PER UDP DATAGRAM AT `Info`,
+                 * AND THE DEFAULT 40 KB ROTATION THREW THE LOG AWAY
+                 * FASTER THAN IT COULD BE READ.** Measured 2026-09-08:
+                 * `Carta.log` held EIGHT SECONDS of history under an
+                 * app that had been up for three minutes, and two
+                 * thirds of its lines were `poll_send`. A pairing
+                 * retry logged a line, the line was rotated out before
+                 * anyone could read it, and its absence looked exactly
+                 * like the retry never firing — the same
+                 * silent-instrument defect as the accept loop it was
+                 * written to observe.
+                 *
+                 * ⚠️ **AND `level_for` DOES NOT FIX IT — MEASURED.**
+                 * `.level_for("iroh::socket::transports", Warn)` was
+                 * tried first and changed NOTHING: the lines kept
+                 * coming at `Info`. iroh logs through `tracing`, and
+                 * those records reach `log` by tracing's fallback,
+                 * which builds a record and logs it without the
+                 * per-target check `level_for` installs. The global
+                 * `.level` still bites, because tracing's fallback
+                 * does consult `log::max_level()` — but lowering that
+                 * would silence this app's own lines too, which are
+                 * the point.
+                 *
+                 * So the lever is RETENTION, not volume. 8 MB is
+                 * roughly two hours of a talkative peer session
+                 * instead of forty seconds. */
+                .max_file_size(8_000_000)
                 .build(),
         );
     }
@@ -448,25 +506,6 @@ pub fn run() {
                 .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
                 .build(),
         );
-    }
-
-    /* The local inference runtime (crates/tauri-plugin-inference). Its
-     * commands are granted by `inference:default` in capabilities/default.json.
-     *
-     * DESKTOP ONLY, and it is the platform that decides rather than a
-     * preference: `lemond` ships for macOS, Windows and Linux and there is no
-     * mobile build of it, so a phone has nothing for this plugin to supervise.
-     * Not compiling it there also keeps its TLS provider off the mobile
-     * targets — see the crate's Cargo.toml, where `tauri-plugin-peer` makes
-     * the opposite choice for the opposite reason.
-     *
-     * It launches NOTHING at boot. WI-15.3's F2: a runtime that has not been
-     * downloaded is `Absent`, which is a normal state and not a failed start —
-     * if it were a failure it would take the Codex and Claude routes down with
-     * it on every first launch, and those need no download at all. */
-    #[cfg(feature = "desktop")]
-    {
-        builder = builder.plugin(tauri_plugin_inference::init());
     }
 
     /* The browser client's host. DESKTOP ONLY, and gated at the DEPENDENCY as

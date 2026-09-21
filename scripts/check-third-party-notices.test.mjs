@@ -96,7 +96,7 @@ describe('the committed notice', () => {
  * root's font imports.
  */
 describe('what is bundled', () => {
-  const imports = [...read('src/main.tsx').matchAll(/^import '([^']+)'$/gm)].map((match) => match[1])
+  const imports = [...read('src/main.mobile.tsx').matchAll(/^import '([^']+)'$/gm)].map((match) => match[1])
   const fonts = imports.filter((one) => one.startsWith('@fontsource'))
 
   it('finds the font imports it is checking, so this is not vacuous', () => {

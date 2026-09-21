@@ -110,6 +110,35 @@ export interface PaneContext {
 }
 
 /**
+ * WHAT A CONTRIBUTION IS DRAWN AS — a name, not a glyph.
+ *
+ * ⚠️ **EVERY CONTRIBUTION USED TO DRAW A PUZZLE PIECE, AND TWO OF THEM SHIP.**
+ * `SidePane` gave every contributed pane `Icon: Puzzle` and `TitleBar` gave
+ * every contributed screen the same, so **Circle** and **Publish** sat side by
+ * side in the reader's rail as two identical icons. A reader could not tell
+ * which was which, and a jigsaw piece is developer vocabulary — it says "a
+ * plugin goes here", which is true of the architecture and meaningless to
+ * somebody reading a book.
+ *
+ * A NAME rather than a component, for two reasons that point the same way.
+ * This file is React-free and must stay so (see the header, and `PaneRenderer`
+ * for the same constraint solved the same way) — but more importantly **the
+ * glyph set belongs to the design system, not to whoever is writing a
+ * capability**. A contribution says what it is ABOUT; the kernel decides what
+ * that looks like, and the union below is the whole offer. A capability that
+ * could pass any icon it liked is how an icon set stops being one.
+ *
+ * REQUIRED, with no fallback, and that is the fix rather than a nicety: a
+ * default is what let two panes silently share a drawing. Names enter one at a
+ * time as a real contribution needs one, which is this file's standing rule.
+ */
+export type ContributionIcon =
+  /** People the reader knows. */
+  | 'people'
+  /** Anybody at all — published, public, the open network. */
+  | 'globe'
+
+/**
  * A pane in the side pane, contributed by a capability.
  *
  * `id` is `<capability>:<name>` — the registry refuses anything else, so a
@@ -122,6 +151,8 @@ export interface PaneContext {
 export interface PaneContribution {
   readonly id: ContributedPaneId
   readonly label: string
+  /** What the rail draws for it — see `ContributionIcon`. */
+  readonly icon: ContributionIcon
   readonly screens: readonly Screen[]
   readonly order?: number
   readonly render: PaneRenderer
@@ -356,6 +387,8 @@ export interface ScreenContribution {
   readonly id: ContributedScreenId
   /** What the reader sees in the place that switches to it. */
   readonly label: string
+  /** What the titlebar draws for it — see `ContributionIcon`. */
+  readonly icon: ContributionIcon
   readonly render: PaneRenderer
 }
 

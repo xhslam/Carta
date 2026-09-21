@@ -36,9 +36,9 @@ import type { StorageModel } from './storageModel'
  */
 export function formatBytes(bytes: number | null): string {
   if (bytes === null) return '—'
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  if (bytes < 1024) return `${bytes}\u00a0B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}\u00a0KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)}\u00a0MB`
 }
 
 export function StoragePane({ model }: { readonly model: StorageModel }) {
@@ -53,8 +53,12 @@ export function StoragePane({ model }: { readonly model: StorageModel }) {
     setDraft(null)
     /* The model refuses anything outside its own range, so a typo simply
      * leaves the committed value where it was. */
+    // Stryker disable next-line MethodExpression: a number field sanitises anything that is not a number — whitespace included — to '', so no draft it hands over has anything to trim.
     if (draft.trim() !== '') void model.setCoverCapMB(wanted)
   }, [draft, model])
+  /* `void` HERE, ON THE CAP AND ON EVICT, IS SAFE ONLY BECAUSE THE MODEL NEVER
+   * REJECTS — see `StorageModel`. It did, over a ledger that would not read,
+   * and this section drew empty with nothing to say why (2026-09-13 verify). */
   useEffect(() => {
     void model.refresh()
   }, [model])

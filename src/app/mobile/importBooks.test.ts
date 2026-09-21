@@ -88,6 +88,46 @@ describe('bounded mobile content writes', () => {
     file.arrayBuffer = async () => { throw new Error('whole-file fallback') }
     await expect(writeBookContentSafely(fs, path, file)).rejects.toThrow('disk full')
     expect(await fs.readFile(path)).toEqual(new Uint8Array([1, 2, 3]))
-    expect(await fs.exists(`${path}.writing`)).toBe(false)
+    expect([...fs.store.keys()].some((key) => key.startsWith(`${path}.writing.`))).toBe(false)
+  })
+
+  it('syncs the complete temporary file before publishing it, then syncs its directory', async () => {
+    const { writeBookContentSafely } = await import('./importBooks')
+    const fs = fakeFs()
+    const operations: string[] = []
+    const rename = fs.rename.bind(fs)
+    fs.fsync = async (path, level) => { operations.push(`sync:${path}:${level}`) }
+    fs.rename = async (from, to) => {
+      operations.push(`rename:${from}:${to}`)
+      await rename(from, to)
+    }
+
+    await writeBookContentSafely(fs, 'books/test/content.epub', new File(['complete'], 'book.epub'))
+
+    expect(operations).toHaveLength(3)
+    expect(operations[0]).toMatch(/^sync:books\/test\/content\.epub\.writing\.\d+:full$/)
+    expect(operations[1]).toMatch(/^rename:books\/test\/content\.epub\.writing\.\d+:books\/test\/content\.epub$/)
+    expect(operations[2]).toBe('sync:books/test:full')
+  })
+
+  it('uses a private staging file for concurrent writes to the same target', async () => {
+    const { writeBookContentSafely } = await import('./importBooks')
+    const fs = fakeFs()
+    const staged = new Set<string>()
+    const write = fs.writeFile.bind(fs)
+    fs.writeFile = async (path, bytes) => {
+      if (path.includes('.writing.')) staged.add(path)
+      await write(path, bytes)
+    }
+
+    const path = 'books/test/content.epub'
+    await Promise.all([
+      writeBookContentSafely(fs, path, new File(['first'], 'first.epub')),
+      writeBookContentSafely(fs, path, new File(['second'], 'second.epub')),
+    ])
+
+    expect(staged.size).toBe(2)
+    expect([...fs.store.keys()].some((key) => key.startsWith(`${path}.writing.`))).toBe(false)
+    expect(['first', 'second']).toContain(new TextDecoder().decode(await fs.readFile(path)))
   })
 })

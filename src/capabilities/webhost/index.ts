@@ -30,18 +30,26 @@ import { servePipe, type Pump } from './lib/pump'
  * check, no permissions audit, and `capability:remove` cannot cut it out. This
  * repository's whole discipline is that unwatched things drift.
  *
- * ## Why it declares `requires: ['peer']` when it uses no peer-to-peer anything
+ * ## Why it requires nothing
  *
- * It needs the ENVELOPE — the code that turns a service call into bytes and
- * back — and that currently lives in `src/capabilities/peer/lib/envelope.ts`.
- * Nothing about the envelope is peer-to-peer; it was simply written where its
- * first caller was.
+ * ⚠️ **IT DECLARED `requires: ['peer']` FOR FOUR PHASES AFTER THE REASON WENT.**
+ * The reason was the ENVELOPE — the code that turns a service call into bytes
+ * and back — which was written under `peer` because `peer` was its first
+ * caller, though nothing about it is peer-to-peer. Phase 18 gave it a second
+ * transport and **moved it to `src/kernel/core/envelope.ts`**; the paragraph
+ * here even asked for that move, and then stayed as written once it happened.
+ * Nothing under `src/capabilities/webhost/` imports from another capability at
+ * all — `peer/lib/envelope.ts` is a re-export shim that says so itself.
  *
- * So this dependency is honest but misshapen, and the fix is not to fake it
- * here. **The envelope's home is the real question**, and now that two
- * transports need it, the kernel is the defensible answer. Revisit when a third
- * caller appears or when `peer` is next opened; until then this declaration
- * says what is true.
+ * What the stale declaration cost is not nothing: `requires` is a GRANT, the
+ * only thing `check-boundaries`'s `capability-requires-declared` rule consults
+ * before permitting a cross-capability import, so this held the standing right
+ * to reach inside `peer` on the strength of a dependency that had ended. It
+ * also refused any composition without `peer`, by name, for no reason.
+ *
+ * The rule that would have caught it is `capability-requires-used`, added in
+ * the same change (2026-09-19). Registration order is unaffected: this is last
+ * in the desktop list either way.
  *
  * ## Serving the router
  *
@@ -65,16 +73,39 @@ let pump: Pump | null = null
 
 export const webhost: Capability = {
   id: 'webhost',
-  requires: ['peer'],
 
   start(api, signal): Disposable {
     /* TEARDOWN REGISTERED BEFORE ANYTHING IS ACQUIRED, the order `peer`'s own
-     * `start` uses: a failure part-way through leaves nothing running. */
+     * `start` uses: a failure part-way through leaves nothing running.
+     *
+     * ⚠️ **IT STOPPED WHATEVER `pump` HELD, NOT ITS OWN.** `pump` is module
+     * state and this closure ran on teardown, so with two live compositions —
+     * two `start`s with no `stop` between them, which the registry permits and
+     * a test does routinely — the second overwrote the first, and then stopping
+     * the SECOND reached into the FIRST's pump and stopped it. Every connected
+     * browser had its frames drained by nothing, with no error anywhere,
+     * because a stopped pump is exactly as quiet as an idle one.
+     *
+     * The inner disposer twenty lines below already guarded this
+     * (`if (pump === running)`); this one did not, which is why the defect
+     * survived. `index.test.ts` measures it by the LEAK rather than by the
+     * stop, for the reason its own header gives.
+     *
+     * ⚠️ **A `core/renderSlot.ts` HELD THE GENERAL ANSWER — A STACK, so
+     * releasing any holder restores the most recent one still live — AND IT IS
+     * DELETED.** Its only two callers were `inference` and `companion`, which
+     * went with every other AI feature; `webhost` was the one capability never
+     * converted to it. The ownership check here is the hand-rolled version and
+     * is what actually ships. If a third capability meets this, rebuild the
+     * stack from this paragraph rather than looking for the module. */
+    let mine: Pump | null = null
     const stop = () => {
-      pump?.stop()
-      pump = null
+      mine?.stop()
+      if (pump === mine) pump = null
+      mine = null
       host?.dispose()
       host = null
+      signal.removeEventListener('abort', stop)
     }
     let host: Disposable | null = null
     if (signal.aborted) return { dispose: stop }
@@ -86,6 +117,20 @@ export const webhost: Capability = {
      * services, which is what a transport is for. */
     host = api.services.bindServiceHost(async (services) => {
       if (signal.aborted || services.length === 0) return { dispose: () => {} }
+      /* ⚠️ **ONE PUMP ON THE WIRE, AND THE SECOND USED TO JOIN THE FIRST.**
+       * `wire` is a module singleton, and this assigned over `pump` without
+       * stopping what it replaced — so two live compositions (two `start`s with
+       * no `stop` between them, which the registry permits and this file's own
+       * tests do) left TWO pumps polling one session inbox, each with its own
+       * router and `openedBy`. Related frames of one browser could then be
+       * answered by different pumps, and only the newer was reachable to stop.
+       * The disposers below were already ownership-checked; what was missing is
+       * that taking the wire has to RELEASE it first. Found by the 2026-09-19
+       * audit.
+       *
+       * `stop()` is idempotent (`pump.ts` returns early once stopped), so this
+       * is safe when the previous holder has already gone. */
+      pump?.stop()
       pump = servePipe({
         wire: wireOf(),
         services,
@@ -94,6 +139,7 @@ export const webhost: Capability = {
             error: messageOf(thrown),
           }),
       })
+      mine = pump
       const running = pump
       return {
         dispose: () => {
@@ -103,6 +149,18 @@ export const webhost: Capability = {
       }
     })
 
+    /* ⚠️ **`api.onCleanup(stop)` WAS ADDED HERE AND TAKEN OUT AGAIN**, on the
+     * 2026-09-19 audit's suggestion that the teardown was never registered with
+     * the kernel. It is: `registry.ts` folds the RETURNED `Disposable` into
+     * teardown and runs it before the `onCleanup` stack ("Both run on normal
+     * dispose"), and `stop` is that disposer. Registering it twice would only
+     * call an idempotent function twice. Written down because the suggestion is
+     * a reasonable reading of the comment above, and the next reader deserves
+     * the answer rather than the round trip.
+     *
+     * THE ABORT LISTENER IS REMOVED BY `stop` ITSELF, so a manual dispose does
+     * not leave this closure retained until the signal is collected — that half
+     * of the finding was real. */
     signal.addEventListener('abort', stop, { once: true })
     return { dispose: stop }
   },

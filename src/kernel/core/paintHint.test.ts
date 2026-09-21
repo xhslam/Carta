@@ -3,29 +3,14 @@ import { describe, expect, it } from 'vitest'
 import { MIGRATED_KEYS } from './fileStore'
 import { PAINT_HINT_KEY } from './paintHint'
 
-const html = readFileSync(new URL('../../../index.html', import.meta.url), 'utf8')
+const html = readFileSync(new URL('../../../index.mobile.html', import.meta.url), 'utf8')
 
 describe('the first frame’s colour', () => {
-  it('is read in index.html under the key the app writes', () => {
-    /* The inline script cannot import this constant — it runs before any module
-       exists, which is the whole point of it. So the two are checked against
-       each other here. A rename that missed the HTML would pass the build, pass
-       the types, and show up only as a white flash nobody traces back. */
-    expect(html).toContain(PAINT_HINT_KEY)
-  })
-
-  it('runs before the module script, or it cannot paint anything', () => {
-    /* Order is the mechanism. A hint applied after the bundle has been fetched
-       is a hint applied after the frame it exists to colour. */
-    expect(html.indexOf(PAINT_HINT_KEY)).toBeLessThan(html.indexOf('/src/main.tsx'))
-  })
-
-  it('sits in <head>, because that is where the BUILD puts the module script', () => {
-    /* Authored in <body> this was correct in dev and wrong in `dist`: Vite
-       injects the bundle at the end of <head>, so the hint ran after it and
-       painted a frame that had already been drawn. Nothing but a real build
-       showed it — `pnpm dev` serves the file as written. */
-    expect(html.indexOf(PAINT_HINT_KEY)).toBeLessThan(html.indexOf('</head>'))
+  it('leaves the mobile launch frame to the native launch screen', () => {
+    /* Mobile is covered by the native launch screen, so an inline paint-hint
+       script would add CSP surface without preventing a visible flash. */
+    expect(html).not.toContain(PAINT_HINT_KEY)
+    expect(html).toContain('/src/main.mobile.tsx')
   })
 
   it('leaves the charset inside the first 1024 bytes', () => {

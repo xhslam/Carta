@@ -242,7 +242,7 @@ function fakeView(overrides: FakeViewOptions = {}): FakeView {
 const PALETTE: MarkPalette = {
   fill: { yellow: '#F3E6C0', green: '#D1EED3', purple: '#F2E0FF' },
   rule: { yellow: '#E0BE55', green: '#85D288', purple: '#DDAFFF' },
-  companion: '#9E5A16', foreign: '#teal',
+  foreign: '#teal',
 }
 
 function callbacks(
@@ -1608,7 +1608,7 @@ describe('ReaderSession marks', () => {
 
   it.each([
     ['a reader’s rule', { kind: 'highlight', tint: 'purple', style: 'underline' }],
-    ['the companion’s wave', { kind: 'companion' }],
+    ['a wave', { kind: 'highlight', tint: 'purple', style: 'wave' }],
     ['a friend’s underline', { kind: 'circle', readers: 1 }],
   ])('tells the painter which way the text runs — %s', async (_what, annotation) => {
     /* ⚠️ **foliate's `underline`, `strikethrough` and `squiggly` each READ
@@ -1703,21 +1703,21 @@ describe('ReaderSession marks', () => {
     ])
   })
 
-  it('draws the companion’s mark as an amber WAVE whatever the reader chose', async () => {
-    /* Here the colour is not a preference, it is whose mark this is — and so is
-       the shape. The wave is reserved to the companion (`READER_STYLES`), which
-       is what keeps a machine's claim from looking like the reader's own once
-       the reader can draw rules too. A departure from §01, which specified an
-       underline back when every reader's mark was a fill. */
-    expect(await paintOne({ kind: 'companion', tint: 'green', style: 'fill' })).toEqual([
-      { fn: 'WAVE', color: '#9E5A16' },
+  it('draws a reader’s underline as an underline', async () => {
+    expect(await paintOne({ kind: 'highlight', tint: 'green', style: 'underline' })).toEqual([
+      { fn: 'UNDERLINE', color: '#85D288' },
     ])
   })
 
-  it('draws a reader’s underline as an underline, not the companion’s wave', async () => {
-    // The pair above only means something if the reader's rule is a different one.
-    expect(await paintOne({ kind: 'highlight', tint: 'green', style: 'underline' })).toEqual([
-      { fn: 'UNDERLINE', color: '#85D288' },
+  /* ⚠️ **A WAVE STILL REACHES A PAINTER, AND NO READER CAN MAKE ONE.**
+     `READER_STYLES` does not offer it and the store reads a stored one back as
+     an underline — but `styleOf` reads what foliate hands back, untyped, so the
+     painter has to answer for a value the type system never saw. It was the
+     deleted companion's shape, drawn in amber; a wave that arrives now is the
+     reader's own mark and wears the reader's own rule colour. */
+  it('draws a wave that reaches it in the reader’s own rule colour', async () => {
+    expect(await paintOne({ kind: 'highlight', tint: 'green', style: 'wave' })).toEqual([
+      { fn: 'WAVE', color: '#85D288' },
     ])
   })
 
@@ -2001,6 +2001,69 @@ describe('ReaderSession gesture provenance', () => {
 
     doc.dispatch('wheel', wheelEvent({ isTrusted: true }))
     expect(cb.calls['onPageIntent']?.[0]?.[0]).toBe('right')
+  })
+
+  /**
+   * ⚠️ **A DRAGGED LINK NAVIGATED THE WEBVIEW AWAY** (2026-09-19 audit).
+   *
+   * `drop` fires only where `dragover` was cancelled. `#watchDrops` cancelled
+   * it for `Files` alone, so a URL or text drag never reached `onDrop` — and
+   * the whole application was replaced by whatever the link pointed at, which
+   * is the exact failure the method's own header says it exists to prevent.
+   * `onDrop`'s comment claimed it prevented default "unconditionally"; it did,
+   * and it could not run.
+   *
+   * The two questions are separate and are asserted separately: WHETHER the
+   * drop happens (`preventDefault` on the drag) and WHAT the pointer promises
+   * (`dropEffect`). Only the second is file-only.
+   */
+  const dragEvent = (types: readonly string[], file: File | null = null) => {
+    const dataTransfer = {
+      types,
+      dropEffect: 'none',
+      files: { item: () => file },
+    }
+    return { type: 'drag', dataTransfer, prevented: false, preventDefault() { this.prevented = true } }
+  }
+
+  it.each([
+    ['a link', ['text/uri-list']],
+    ['plain text', ['text/plain']],
+    ['nothing it can read', []],
+  ])('cancels the drag for %s, so the drop reaches the reader instead of the webview', async (_what, types) => {
+    const { doc } = await loadedSection()
+    for (const kind of ['dragenter', 'dragover']) {
+      const event = dragEvent(types)
+      doc.dispatch(kind, event)
+      expect(event.prevented, `${kind} was not cancelled, so no drop event fires and the webview navigates`).toBe(true)
+    }
+  })
+
+  it('promises a copy only for files, while still cancelling everything', async () => {
+    const { doc } = await loadedSection()
+
+    const link = dragEvent(['text/uri-list'])
+    doc.dispatch('dragover', link)
+    expect(link.prevented).toBe(true)
+    expect(link.dataTransfer.dropEffect, 'a copy cursor over a link promises an import that never happens').toBe('none')
+
+    const files = dragEvent(['Files'])
+    doc.dispatch('dragover', files)
+    expect(files.prevented).toBe(true)
+    expect(files.dataTransfer.dropEffect).toBe('copy')
+  })
+
+  /* AND THE DROP ITSELF STILL REFUSES WHAT IS NOT A FILE. Cancelling every
+     drag is only safe because this half ignores everything else. */
+  it('takes a dropped file and ignores a dropped link', async () => {
+    const { doc, cb } = await loadedSection()
+
+    doc.dispatch('drop', dragEvent(['text/uri-list']))
+    expect(cb.calls['onFileDropped'] ?? []).toHaveLength(0)
+
+    const book = new File(['x'], 'book.epub')
+    doc.dispatch('drop', dragEvent(['Files'], book))
+    expect(cb.calls['onFileDropped']?.[0]?.[0]).toBe(book)
   })
 
   /* The window must not move. An unconsumed wheel chains outwards until
