@@ -36,8 +36,10 @@ import { applyMetrics } from './kernel/core/metrics'
 import { resolvePlatform } from './kernel/ui/mobile'
 import { bootApp, reportFirstFrame } from './app/bootApp'
 import { MobileApp } from './app/mobile/MobileApp'
+import { installAndroidSpeech } from './app/mobile/androidSpeech'
 
 installFatalHandlers()
+installAndroidSpeech()
 
 const host = document.getElementById('root')
 if (!host) throw new Error('#root is missing from index.mobile.html')

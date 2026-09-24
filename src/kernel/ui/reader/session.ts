@@ -720,6 +720,15 @@ export interface SessionNavigator {
    * still not put it on a page turn — forty cold sections is ~139 ms.
    */
   reanchor: (pending: readonly PendingMark[]) => Promise<PassOutcome>
+  /**
+   * Readable sections from the already-open book, in spine order.
+   *
+   * The documents come from `section.createDocument()` so they pass through
+   * the same script refusal and language setup as the reader. Consumers must
+   * keep the walk lazy: an audiobook can be a large book, and retaining every
+   * parsed section at once would duplicate the open book in memory.
+   */
+  walkSections?: (signal: AbortSignal) => AsyncGenerator<{ readonly index: number; readonly doc: Document }>
 }
 
 export interface SessionDeps {
@@ -1594,6 +1603,7 @@ export class ReaderSession {
          with an empty walk rather than parsing sections of a book nobody is
          reading. */
       reanchor: (pending) => this.reanchorUnplaced(pending),
+      walkSections: (signal) => this.walkReadableSections(signal),
     })
 
     this.#cb.onFixedLayout(view.isFixedLayout)
@@ -2323,6 +2333,29 @@ export class ReaderSession {
       live: () => !this.#disposed && this.#view === view,
       breathe: BREATHE,
     })
+  }
+
+  /** Walk the open book's readable spine sections without retaining them. */
+  async *walkReadableSections(
+    signal: AbortSignal,
+  ): AsyncGenerator<{ readonly index: number; readonly doc: Document }> {
+    const view = this.#view
+    const sections = view?.book?.sections
+    if (this.#disposed || !view || !Array.isArray(sections)) return
+
+    for (let index = 0; index < sections.length; index += 1) {
+      if (signal.aborted || this.#disposed || this.#view !== view) return
+      const section = sections[index] as
+        | { linear?: unknown; createDocument?: () => Promise<Document> }
+        | null
+        | undefined
+      if (!section || section.linear === 'no' || typeof section.createDocument !== 'function') continue
+
+      const doc = await section.createDocument()
+      if (signal.aborted || this.#disposed || this.#view !== view) return
+      yield { index, doc }
+      await BREATHE()
+    }
   }
 
   /**

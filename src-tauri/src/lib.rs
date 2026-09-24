@@ -165,6 +165,133 @@ const OPENABLE: [&str; 2] = ["http://", "https://"];
 /// The longest URL worth launching. See `externalLink.ts` for the same number.
 const MAX_URL: usize = 2048;
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioExportChunk {
+    text: String,
+    #[serde(rename = "voiceURI")]
+    voice_uri: String,
+    rate: f32,
+    gap_after_ms: u32,
+}
+
+#[derive(serde::Serialize)]
+struct AudioExportProgress {
+    id: String,
+    kind: &'static str,
+    completed: u32,
+    total: u32,
+}
+
+#[cfg(target_os = "ios")]
+struct AudioExportContext {
+    app: tauri::AppHandle,
+    id: String,
+}
+
+#[cfg(target_os = "ios")]
+unsafe extern "C" fn audio_export_progress(context: *mut std::ffi::c_void, completed: u32, total: u32) {
+    use tauri::Emitter;
+
+    if context.is_null() {
+        return;
+    }
+    let context = unsafe { &*(context as *const AudioExportContext) };
+    let _ = context.app.emit(
+        "carta-audiobook-progress",
+        AudioExportProgress {
+            id: context.id.clone(),
+            kind: "progress",
+            completed,
+            total,
+        },
+    );
+}
+
+#[cfg(target_os = "ios")]
+extern "C" {
+    fn carta_export_audiobook_json(
+        json: *const std::ffi::c_char,
+        destination: *const std::ffi::c_char,
+        progress: Option<unsafe extern "C" fn(*mut std::ffi::c_void, u32, u32)>,
+        context: *mut std::ffi::c_void,
+        error: *mut std::ffi::c_char,
+        error_capacity: usize,
+    ) -> i32;
+    fn carta_cancel_audiobook();
+}
+
+#[tauri::command]
+async fn export_audiobook_ios(
+    app: tauri::AppHandle,
+    id: String,
+    chunks: Vec<AudioExportChunk>,
+    destination: String,
+) -> Result<(), String> {
+    #[cfg(target_os = "ios")]
+    {
+        use std::ffi::CString;
+
+        if chunks.is_empty() {
+            return Err("This book has no readable text to export".into());
+        }
+        let json = serde_json::to_string(&chunks).map_err(|error| error.to_string())?;
+        let json = CString::new(json).map_err(|_| "Audiobook text contains a null byte".to_owned())?;
+        let destination = CString::new(destination)
+            .map_err(|_| "The selected save path contains a null byte".to_owned())?;
+        let (result, message) = tauri::async_runtime::spawn_blocking(move || {
+            use std::ffi::CStr;
+
+            let context = Box::into_raw(Box::new(AudioExportContext { app, id }));
+            let mut error = vec![0i8; 1024];
+            let result = unsafe {
+                carta_export_audiobook_json(
+                    json.as_ptr(),
+                    destination.as_ptr(),
+                    Some(audio_export_progress),
+                    context.cast(),
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            };
+            unsafe { drop(Box::from_raw(context)) };
+            let message = unsafe { CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            (result, message)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(if message.is_empty() {
+                format!("Audiobook export failed ({result})")
+            } else {
+                message
+            })
+        }
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = (app, id, chunks, destination);
+        Err("Native Apple audiobook export is only available on iOS".into())
+    }
+}
+
+#[tauri::command]
+fn cancel_audiobook_ios() -> Result<(), String> {
+    #[cfg(target_os = "ios")]
+    unsafe {
+        carta_cancel_audiobook();
+        Ok(())
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        Err("Native Apple audiobook export is only available on iOS".into())
+    }
+}
+
 /// Open a web link a book asked for.
 ///
 /// WHY THIS COMMAND EXISTS AT ALL. foliate hands any link whose scheme leaves
@@ -450,6 +577,8 @@ pub fn run() {
         validates its own argument rather than trusting the caller. */
         .invoke_handler(tauri::generate_handler![
             open_external,
+            export_audiobook_ios,
+            cancel_audiobook_ios,
             atomic::write_atomic,
             atomic::fsync_in_data_dir,
             atomic::read_range_in_data_dir,

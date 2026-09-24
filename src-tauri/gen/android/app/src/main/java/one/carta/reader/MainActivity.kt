@@ -1,9 +1,11 @@
 package one.carta.reader
 
 import android.content.Intent
+import android.app.Activity
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.speech.tts.TextToSpeech
 import android.view.View
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
@@ -18,9 +20,14 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 
 class MainActivity : TauriActivity() {
+  private data class PendingExport(val id: String, val chunksJson: String)
+
   private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
   private var isImmersiveReading: Boolean = false
   private var cartaWebView: WebView? = null
+  private var cartaSpeech: CartaSpeech? = null
+  private var voiceInstallBefore: List<String>? = null
+  private var pendingExport: PendingExport? = null
 
   private val fileChooserLauncher = registerForActivityResult(
     ActivityResultContracts.StartActivityForResult()
@@ -30,11 +37,90 @@ class MainActivity : TauriActivity() {
     fileChooserCallback = null
   }
 
+  private val voiceInstallerLauncher = registerForActivityResult(
+    ActivityResultContracts.StartActivityForResult()
+  ) { result ->
+    val before = voiceInstallBefore ?: emptyList()
+    voiceInstallBefore = null
+    cartaSpeech?.refreshVoices(before, result.resultCode == Activity.RESULT_OK)
+  }
+
+  private val audiobookLauncher = registerForActivityResult(
+    ActivityResultContracts.CreateDocument("audio/wav")
+  ) { uri ->
+    val pending = pendingExport
+    pendingExport = null
+    if (pending == null) return@registerForActivityResult
+    if (uri == null) cartaSpeech?.cancelExportFromPicker(pending.id)
+    else cartaSpeech?.startExport(pending.id, uri, pending.chunksJson)
+  }
+
   inner class AndroidBridge {
     @JavascriptInterface
     fun setImmersiveReading(enabled: Boolean) {
       runOnUiThread {
         applyImmersiveReading(enabled)
+      }
+    }
+
+    @JavascriptInterface
+    fun ttsVoices(): String = cartaSpeech?.voices() ?: "[]"
+
+    @JavascriptInterface
+    fun ttsState(): String = cartaSpeech?.state() ?: "loading"
+
+    @JavascriptInterface
+    fun ttsSpeak(id: String, text: String, voiceUri: String, rate: Float) {
+      cartaSpeech?.speak(id, text, voiceUri, rate)
+    }
+
+    @JavascriptInterface
+    fun ttsStop() {
+      cartaSpeech?.stop()
+    }
+
+    @JavascriptInterface
+    fun ttsInstallVoices() {
+      runOnUiThread {
+        val before = cartaSpeech?.voiceUris().orEmpty()
+        val intent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
+        cartaSpeech?.defaultEnginePackage()?.let(intent::setPackage)
+        voiceInstallBefore = before
+        try {
+          voiceInstallerLauncher.launch(intent)
+        } catch (error: Exception) {
+          voiceInstallBefore = null
+          cartaSpeech?.installFailed(before)
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun ttsExport(id: String, fileName: String, chunksJson: String) {
+      runOnUiThread {
+        if (pendingExport != null) {
+          cartaSpeech?.exportRequestFailed(id, "An audiobook export is already waiting for a save location")
+          return@runOnUiThread
+        }
+        pendingExport = PendingExport(id, chunksJson)
+        try {
+          audiobookLauncher.launch(fileName)
+        } catch (error: Exception) {
+          pendingExport = null
+          cartaSpeech?.exportRequestFailed(id, error.message ?: "Could not open the save location")
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun ttsCancelExport(id: String) {
+      runOnUiThread {
+        if (pendingExport?.id == id) {
+          pendingExport = null
+          cartaSpeech?.cancelExportFromPicker(id)
+        } else {
+          cartaSpeech?.cancelExport(id)
+        }
       }
     }
   }
@@ -75,6 +161,7 @@ class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     cartaWebView = webView
+    cartaSpeech = CartaSpeech(this, webView)
     WebView.setWebContentsDebuggingEnabled(true)
     webView.addJavascriptInterface(AndroidBridge(), "CartaAndroidBridge")
     webView.webChromeClient = object : WebChromeClient() {
@@ -132,5 +219,11 @@ class MainActivity : TauriActivity() {
       WindowInsetsCompat.CONSUMED
     }
     ViewCompat.requestApplyInsets(content)
+  }
+
+  override fun onDestroy() {
+    cartaSpeech?.shutdown()
+    cartaSpeech = null
+    super.onDestroy()
   }
 }

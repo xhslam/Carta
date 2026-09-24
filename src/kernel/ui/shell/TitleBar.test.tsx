@@ -11,9 +11,16 @@ afterEach(cleanup)
 const speech: Speech = {
   available: false,
   speaking: false,
+  paused: false,
   followsWords: false,
+  chapters: { back: false, forward: false },
   start: () => {},
   stop: () => {},
+  pause: () => {},
+  resume: () => {},
+  stepSentence: () => {},
+  stepParagraph: () => {},
+  stepChapter: () => {},
 }
 
 function bar(platform: Platform) {

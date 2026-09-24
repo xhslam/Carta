@@ -10,6 +10,7 @@ import {
   type Theme,
   type Typeface,
 } from '../../kernel'
+import { MOBILE_NARRATION_SETTINGS } from './narrationSettings'
 
 export interface ReadingPrefs {
   readonly storedTheme: Theme
@@ -23,6 +24,11 @@ export interface ReadingPrefs {
   readonly brightness: number
   readonly contrast: number
   readonly markTint: MarkTint
+  readonly readingVoice: Readonly<Record<string, string>>
+  readonly readingRate: number
+  readonly readingNotesAloud: boolean
+  readonly sentenceGapMs: number
+  readonly paragraphGapMs: number
 }
 
 function sameSpacing(a: SpacingIndices, b: SpacingIndices): boolean {
@@ -54,6 +60,14 @@ function sameReadingStyle(a: ReadingStyle, b: ReadingStyle): boolean {
   )
 }
 
+function sameVoices(
+  a: Readonly<Record<string, string>>,
+  b: Readonly<Record<string, string>>,
+): boolean {
+  const keys = Object.keys(a)
+  return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key])
+}
+
 export function useReadingPrefs(settings: SettingsStore): ReadingPrefs {
   const cached = useRef<ReadingPrefs | null>(null)
 
@@ -69,11 +83,19 @@ export function useReadingPrefs(settings: SettingsStore): ReadingPrefs {
     const brightness = settings.get(KERNEL_SETTINGS.brightness)
     const contrast = settings.get(KERNEL_SETTINGS.contrast)
     const markTint = settings.get(KERNEL_SETTINGS.markTint)
+    const rawReadingVoice = settings.get(MOBILE_NARRATION_SETTINGS.readingVoice)
+    const readingRate = settings.get(MOBILE_NARRATION_SETTINGS.readingRate)
+    const readingNotesAloud = settings.get(MOBILE_NARRATION_SETTINGS.readingNotesAloud)
+    const sentenceGapMs = settings.get(MOBILE_NARRATION_SETTINGS.sentenceGapMs)
+    const paragraphGapMs = settings.get(MOBILE_NARRATION_SETTINGS.paragraphGapMs)
 
     const prev = cached.current
     if (prev) {
       const spacing = sameSpacing(prev.spacing, rawSpacing) ? prev.spacing : rawSpacing
       const readingStyle = sameReadingStyle(prev.readingStyle, rawStyle) ? prev.readingStyle : rawStyle
+      const readingVoice = sameVoices(prev.readingVoice, rawReadingVoice)
+        ? prev.readingVoice
+        : rawReadingVoice
 
       if (
         prev.storedTheme === storedTheme &&
@@ -86,7 +108,12 @@ export function useReadingPrefs(settings: SettingsStore): ReadingPrefs {
         prev.pageLayout === pageLayout &&
         prev.brightness === brightness &&
         prev.contrast === contrast &&
-        prev.markTint === markTint
+        prev.markTint === markTint &&
+        prev.readingVoice === readingVoice &&
+        prev.readingRate === readingRate &&
+        prev.readingNotesAloud === readingNotesAloud &&
+        prev.sentenceGapMs === sentenceGapMs &&
+        prev.paragraphGapMs === paragraphGapMs
       ) {
         return prev
       }
@@ -103,6 +130,11 @@ export function useReadingPrefs(settings: SettingsStore): ReadingPrefs {
         brightness,
         contrast,
         markTint,
+        readingVoice,
+        readingRate,
+        readingNotesAloud,
+        sentenceGapMs,
+        paragraphGapMs,
       }
       cached.current = next
       return next
@@ -120,6 +152,11 @@ export function useReadingPrefs(settings: SettingsStore): ReadingPrefs {
       brightness,
       contrast,
       markTint,
+      readingVoice: rawReadingVoice,
+      readingRate,
+      readingNotesAloud,
+      sentenceGapMs,
+      paragraphGapMs,
     }
     cached.current = initial
     return initial

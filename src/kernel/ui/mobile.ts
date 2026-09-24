@@ -95,3 +95,21 @@ export { findMark } from '../core/markMatch'
 export { citation } from '../core/citation'
 export type { Source } from '../core/citation'
 export { pageFilter } from './reader/fixedLayout'
+
+/* Mobile read-aloud: the hook owns engine timing; the composition owns the
+ * touch transport and preference surface. */
+export { useSpeech } from './reader/useSpeech'
+export type { Speech, SpeechPaging } from './reader/useSpeech'
+export { useVoices } from './hooks/useVoices'
+export { collectText, documentLang } from './reader/speech'
+export { sentenceSpansOf } from './reader/wordSnap/sentenceOf'
+export {
+  bestVoice,
+  chosenVoice,
+  voiceFor,
+  voiceGroups,
+  voiceKey,
+  voiceOptions,
+  NO_GOOD_VOICE,
+} from './reader/voiceChoice'
+export type { ReadableTier, VoiceFacts } from './reader/voiceChoice'

@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Highlighter, List, Search as SearchIcon, Type } from 'lucide-react'
+import { AudioLines, Highlighter, List, Search as SearchIcon, Type } from 'lucide-react'
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import { save } from '@tauri-apps/plugin-dialog'
 import { BottomSheet } from '../shell/BottomSheet'
 import { SelectionBar } from '../shell/SelectionBar'
 import {
@@ -16,6 +19,11 @@ import {
   citation,
   pageFilter,
   isPlaced,
+  collectText,
+  documentLang,
+  useSpeech,
+  useVoices,
+  voiceFor,
 } from '../../kernel/ui/mobile'
 import {
   KERNEL_SETTINGS,
@@ -43,8 +51,11 @@ import { MobileBottomConsole } from './MobileBottomConsole'
 import { MobileAmbientFooter } from './MobileAmbientFooter'
 import { MobileContentsDrawer } from './MobileContentsDrawer'
 import { MobileAppearanceSheet } from './MobileAppearanceSheet'
+import { MobileNarrationSheet } from './MobileNarrationSheet'
 import { useReadingPrefs } from './useReadingPrefs'
 import { useImmersiveMode } from './useImmersiveMode'
+import { MOBILE_NARRATION_SETTINGS, NARRATION_RATES } from './narrationSettings'
+import { audiobookChunks, audiobookFileName, type AudiobookChunk } from './audiobookExport'
 import styles from './Reader.module.css'
 
 export interface ReaderProps {
@@ -54,6 +65,22 @@ export interface ReaderProps {
   readonly onClose: () => void
   readonly services: KernelServices
   readonly titleOf?: (bookId: string) => string | undefined
+}
+
+interface AudiobookEvent {
+  readonly id: string
+  readonly kind: 'progress' | 'done' | 'error' | 'cancelled'
+  readonly completed: number
+  readonly total: number
+  readonly message?: string
+  readonly stage?: 'synthesis' | 'combining'
+}
+
+interface AudiobookState {
+  readonly busy: boolean
+  readonly completed: number
+  readonly total: number
+  readonly message: string
 }
 
 export function Reader({ file, bookId, name, onClose, services, titleOf }: ReaderProps) {
@@ -66,6 +93,11 @@ export function Reader({ file, bookId, name, onClose, services, titleOf }: Reade
   const [toc, setToc] = useState<readonly TocItem[]>([])
   const [meta, setMeta] = useState<BookMeta | null>(null)
   const [fixedLayout, setFixedLayout] = useState(false)
+  const [readingDoc, setReadingDoc] = useState<Document | null>(null)
+  const [audiobookState, setAudiobookState] = useState<AudiobookState | null>(null)
+  const audiobookId = useRef('')
+  const audiobookAbort = useRef<AbortController | null>(null)
+  const audiobookNative = useRef(false)
 
   const marks = useMarks(services.marks, bookId)
 
@@ -94,7 +126,7 @@ export function Reader({ file, bookId, name, onClose, services, titleOf }: Reade
 
   useImmersiveMode(true)
 
-  const [tool, setTool] = useState<'contents' | 'search' | 'notes' | 'settings' | 'appearance' | null>(null)
+  const [tool, setTool] = useState<'contents' | 'search' | 'notes' | 'settings' | 'appearance' | 'narration' | null>(null)
   const [chrome, setChrome] = useState(false)
   const [position, setPosition] = useState<{
     cfi: string | null
@@ -180,6 +212,7 @@ export function Reader({ file, bookId, name, onClose, services, titleOf }: Reade
     setFootnoteMount?: (mount: HTMLElement | null, within: HTMLElement | null) => void
     closeFootnote?: () => void
     placeHere?: () => BookmarkPlace | null
+    walkSections?: (signal: AbortSignal) => AsyncGenerator<{ readonly index: number; readonly doc: Document }>
   } | null>(null)
 
   const placeHere = useCallback(() => navigator.current?.placeHere?.() ?? null, [])
@@ -336,6 +369,14 @@ export function Reader({ file, bookId, name, onClose, services, titleOf }: Reade
     toggleChrome: useCallback(() => setChrome((was) => !was), []),
   })
 
+  const takeDocument = useCallback(
+    (generation: number, doc: Document | null) => {
+      watchDocument(generation, doc)
+      setReadingDoc(doc)
+    },
+    [watchDocument],
+  )
+
   const rememberRef = useRef(services.library.rememberPosition)
   rememberRef.current = services.library.rememberPosition
 
@@ -461,6 +502,70 @@ export function Reader({ file, bookId, name, onClose, services, titleOf }: Reade
     prefsStore.set(KERNEL_SETTINGS.themeFollowsOs, false)
   }, [theme, prefsStore])
 
+  const speechPaging = useMemo(
+    () => ({
+      next: () => navigator.current?.next(),
+      chapter: {
+        can: (by: -1 | 1) => {
+          const at = currentChapterIdx + by
+          return currentChapterIdx >= 0 && at >= 0 && at < flatToc.length
+        },
+        go: (by: -1 | 1) => {
+          const at = currentChapterIdx + by
+          const target = currentChapterIdx >= 0 ? flatToc[at] : undefined
+          if (!target?.href) return false
+          navigator.current?.goTo(target.href)
+          return true
+        },
+      },
+    }),
+    [currentChapterIdx, flatToc],
+  )
+
+  const speechPrefs = useMemo(
+    () => ({
+      voices: prefs.readingVoice,
+      rate: prefs.readingRate,
+      sentenceGapMs: prefs.sentenceGapMs,
+      paragraphGapMs: prefs.paragraphGapMs,
+      notesAloud: prefs.readingNotesAloud,
+    }),
+    [
+      prefs.readingVoice,
+      prefs.readingRate,
+      prefs.sentenceGapMs,
+      prefs.paragraphGapMs,
+      prefs.readingNotesAloud,
+    ],
+  )
+  const speech = useSpeech(readingDoc, speechPaging, speechPrefs)
+  const voices = useVoices()
+  const narrationLang = readingDoc ? documentLang(readingDoc) : null
+  const narrationAnswer = useMemo(
+    () => voiceFor(voices, narrationLang, prefs.readingVoice),
+    [voices, narrationLang, prefs.readingVoice],
+  )
+  const nativeAndroidSpeech = typeof window !== 'undefined' && !!window.CartaAndroidBridge
+  const narrationReady = narrationAnswer.kind !== 'none' && (!nativeAndroidSpeech || voices.length > 0)
+
+  const onListen = useCallback(() => {
+    if (!speech.available) {
+      setProblem(uiText(language, '此设备的 WebView 没有提供朗读引擎。', 'This device WebView does not provide a speech engine.'))
+      return
+    }
+    if (!narrationReady) {
+      setTool('narration')
+      return
+    }
+    speech.start()
+  }, [language, narrationReady, speech])
+
+  const onCycleRate = useCallback(() => {
+    const current = NARRATION_RATES.indexOf(prefs.readingRate as (typeof NARRATION_RATES)[number])
+    const next = NARRATION_RATES[(current + 1 + NARRATION_RATES.length) % NARRATION_RATES.length] ?? 1
+    prefsStore.set(MOBILE_NARRATION_SETTINGS.readingRate, next)
+  }, [prefs.readingRate, prefsStore])
+
   const jacketSaved = useRef(false)
   const onCover = useCallback(
     (_generation: number, cover: Blob | null) => {
@@ -502,6 +607,193 @@ export function Reader({ file, bookId, name, onClose, services, titleOf }: Reade
   )
 
   const displayTitle = meta?.title ?? titleOf?.(bookId) ?? name
+
+  const exportAudiobook = useCallback(() => {
+    void (async () => {
+      const id = `carta-audiobook-${Date.now()}`
+      const controller = new AbortController()
+      audiobookId.current = id
+      audiobookAbort.current = controller
+      audiobookNative.current = false
+      setAudiobookState({
+        busy: true,
+        completed: 0,
+        total: 0,
+        message: uiText(language, '正在整理章节…', 'Preparing book sections…'),
+      })
+      speech.stop()
+
+      try {
+        const nav = navigator.current
+        if (!nav?.walkSections) throw new Error('The open book cannot provide its sections for export.')
+        const chunks: AudiobookChunk[] = []
+        let sectionCount = 0
+        for await (const { doc } of nav.walkSections(controller.signal)) {
+          if (controller.signal.aborted) throw new Error('Export cancelled')
+          sectionCount += 1
+          const lang = documentLang(doc)
+          const answer = voiceFor(voices, lang, prefs.readingVoice)
+          const voice = answer.kind === 'voice' ? answer.voice : null
+          if (!voice || voice.localService === false) {
+            throw new Error(lang
+              ? `No compatible offline voice is installed for ${lang}. Install one or choose a voice, then retry.`
+              : 'This section has no declared language. Choose a voice for it in narration settings, then retry.')
+          }
+          const spoken = collectText(doc, { notes: prefs.readingNotesAloud })
+          const sectionChunks = audiobookChunks(
+            spoken.text,
+            lang,
+            voice.voiceURI,
+            prefs.readingRate,
+            prefs.sentenceGapMs,
+            prefs.paragraphGapMs,
+            spoken.blocks,
+          )
+          const firstSectionChunk = chunks.length
+          chunks.push(...sectionChunks)
+          if (chunks.length > firstSectionChunk) {
+            const last = chunks[chunks.length - 1]
+            if (last) chunks[chunks.length - 1] = { ...last, gapAfterMs: prefs.paragraphGapMs }
+          }
+          if (sectionCount % 3 === 0) {
+            setAudiobookState({
+              busy: true,
+              completed: 0,
+              total: 0,
+              message: uiText(language, `已整理 ${sectionCount} 个章节…`, `Prepared ${sectionCount} sections…`),
+            })
+          }
+        }
+        if (controller.signal.aborted) throw new Error('Export cancelled')
+        if (chunks.length === 0) throw new Error('This book has no readable text to export.')
+        const lastChunk = chunks[chunks.length - 1]
+        if (lastChunk) chunks[chunks.length - 1] = { ...lastChunk, gapAfterMs: 0 }
+
+        setAudiobookState({
+          busy: true,
+          completed: 0,
+          total: chunks.length,
+          message: uiText(language, `正在合成 0/${chunks.length} 句…`, `Synthesizing 0/${chunks.length} sentences…`),
+        })
+        const isAndroid = !!window.CartaAndroidBridge
+        if (isAndroid) {
+          audiobookNative.current = true
+          await new Promise<void>((resolve, reject) => {
+            const onNativeEvent = (event: Event) => {
+              const detail = (event as CustomEvent<AudiobookEvent>).detail
+              if (detail.id !== id) return
+              if (detail.kind === 'progress') {
+                setAudiobookState({
+                  busy: true,
+                  completed: detail.completed,
+                  total: detail.total,
+                  message: detail.stage === 'combining'
+                    ? uiText(language, '正在合并音频…', 'Combining audio…')
+                    : uiText(language,
+                      `正在合成 ${detail.completed}/${detail.total} 句…`,
+                      `Synthesizing ${detail.completed}/${detail.total} sentences…`),
+                })
+                return
+              }
+              window.removeEventListener('carta:audiobook-export', onNativeEvent)
+              audiobookNative.current = false
+              if (detail.kind === 'done') {
+                setAudiobookState({
+                  busy: false,
+                  completed: detail.total,
+                  total: detail.total,
+                  message: uiText(language, '有声书已保存。', 'Audiobook saved.'),
+                })
+                resolve()
+              } else if (detail.kind === 'cancelled') {
+                const partial = detail.message?.includes('partial WAV')
+                setAudiobookState({
+                  busy: false,
+                  completed: detail.completed,
+                  total: detail.total,
+                  message: partial
+                    ? uiText(language, '已取消；保存位置可能留有不完整的 WAV 文件。', 'Export cancelled; an incomplete WAV may remain at the save location.')
+                    : uiText(language, '已取消导出。', 'Export cancelled.'),
+                })
+                resolve()
+              } else {
+                const message = detail.message ?? 'Android could not export this audiobook.'
+                setAudiobookState({ busy: false, completed: detail.completed, total: detail.total, message: `${uiText(language, '导出失败：', 'Export failed: ')}${message}` })
+                reject(new Error(message))
+              }
+            }
+            window.addEventListener('carta:audiobook-export', onNativeEvent)
+            try {
+              window.CartaAndroidBridge?.ttsExport?.(id, audiobookFileName(displayTitle), JSON.stringify(chunks))
+            } catch (error) {
+              window.removeEventListener('carta:audiobook-export', onNativeEvent)
+              audiobookNative.current = false
+              reject(error)
+            }
+          })
+          return
+        }
+
+        const destination = await save({
+          defaultPath: audiobookFileName(displayTitle),
+          filters: [{ name: 'WAV audio', extensions: ['wav'] }],
+        })
+        if (!destination) {
+          setAudiobookState({ busy: false, completed: 0, total: chunks.length, message: uiText(language, '已取消导出。', 'Export cancelled.') })
+          return
+        }
+        if (controller.signal.aborted) throw new Error('Export cancelled')
+
+        audiobookNative.current = true
+        const unlisten = await listen<AudiobookEvent>('carta-audiobook-progress', ({ payload }) => {
+          if (payload.id !== id || payload.kind !== 'progress') return
+          setAudiobookState({
+            busy: true,
+            completed: payload.completed,
+            total: payload.total,
+            message: uiText(language,
+              `正在合成 ${payload.completed}/${payload.total} 句…`,
+              `Synthesizing ${payload.completed}/${payload.total} sentences…`),
+          })
+        })
+        try {
+          await invoke('export_audiobook_ios', { id, chunks, destination })
+          setAudiobookState({ busy: false, completed: chunks.length, total: chunks.length, message: uiText(language, '有声书已保存。', 'Audiobook saved.') })
+        } finally {
+          unlisten()
+          audiobookNative.current = false
+        }
+      } catch (error) {
+        const cancelled = controller.signal.aborted
+        const message = cancelled
+          ? uiText(language, '已取消导出。', 'Export cancelled.')
+          : `${uiText(language, '导出失败：', 'Export failed: ')}${error instanceof Error ? error.message : String(error)}`
+        setAudiobookState({ busy: false, completed: 0, total: 0, message })
+      } finally {
+        if (audiobookId.current === id) {
+          audiobookAbort.current = null
+          audiobookNative.current = false
+        }
+      }
+    })()
+  }, [displayTitle, language, prefs.paragraphGapMs, prefs.readingNotesAloud, prefs.readingRate, prefs.readingVoice, prefs.sentenceGapMs, speech, voices])
+
+  const cancelAudiobookExport = useCallback(() => {
+    const controller = audiobookAbort.current
+    const id = audiobookId.current
+    if (!controller) return
+    controller.abort()
+    if (!audiobookNative.current) {
+      setAudiobookState({ busy: false, completed: 0, total: 0, message: uiText(language, '已取消导出。', 'Export cancelled.') })
+      return
+    }
+    if (window.CartaAndroidBridge) {
+      window.CartaAndroidBridge.ttsCancelExport?.(id)
+    } else {
+      void invoke('cancel_audiobook_ios').catch(() => undefined)
+    }
+    setAudiobookState((current) => current ? { ...current, message: uiText(language, '正在取消…', 'Cancelling…') } : current)
+  }, [language])
 
   return (
     <main className={styles.screen} ref={setScreenHost} data-theme={theme}>
@@ -549,6 +841,12 @@ export function Reader({ file, bookId, name, onClose, services, titleOf }: Reade
         onToggleTheme={onToggleTheme}
         onOpenSearch={() => setTool('search')}
         onOpenNotes={() => setTool('notes')}
+        speech={speech}
+        narrationReady={narrationReady}
+        readingRate={prefs.readingRate}
+        onListen={onListen}
+        onOpenNarration={() => setTool('narration')}
+        onCycleRate={onCycleRate}
         theme={theme}
       />
 
@@ -610,6 +908,15 @@ export function Reader({ file, bookId, name, onClose, services, titleOf }: Reade
                 onClick={() => setTool('search')}
               >
                 <SearchIcon size={ICON.tab} strokeWidth={ICON.stroke} />
+              </button>
+              <button
+                type="button"
+                className={styles.toolTab}
+                aria-pressed={tool === 'narration'}
+                aria-label={uiText(language, '朗读设置', 'Narration')}
+                onClick={() => setTool('narration')}
+              >
+                <AudioLines size={ICON.tab} strokeWidth={ICON.stroke} />
               </button>
               <button
                 type="button"
@@ -684,6 +991,18 @@ export function Reader({ file, bookId, name, onClose, services, titleOf }: Reade
           {tool === 'search' && <SearchPanel book={searchable} />}
           {(tool === 'settings' || tool === 'appearance') && (
             <MobileAppearanceSheet settings={prefsStore} />
+          )}
+          {tool === 'narration' && (
+            <MobileNarrationSheet
+              settings={prefsStore}
+              prefs={prefs}
+              lang={narrationLang}
+              voices={voices}
+              fixedLayout={fixedLayout}
+              exportState={audiobookState}
+              onExport={exportAudiobook}
+              onCancelExport={cancelAudiobookExport}
+            />
           )}
         </BottomSheet>
       )}
@@ -821,7 +1140,7 @@ export function Reader({ file, bookId, name, onClose, services, titleOf }: Reade
           lastLocation={lastLocation}
           onToc={takeToc}
           onRelocate={remember}
-          onDocument={watchDocument}
+          onDocument={takeDocument}
           onMeta={takeMeta}
           onCover={onCover}
           onError={onError}

@@ -311,8 +311,13 @@ describe('Mobile Reader', () => {
 
     expect(screen.getByRole('dialog', { name: 'Tools' })).toBeDefined()
     expect(screen.getByRole('button', { name: 'Search' })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Narration' })).toBeDefined()
     expect(screen.getByRole('button', { name: 'Notes' })).toBeDefined()
     expect(screen.getByRole('button', { name: 'Reading' })).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Narration' }))
+    expect(screen.getByRole('heading', { name: 'Read aloud' })).toBeDefined()
+    expect(screen.getByRole('combobox', { name: 'Voice' })).toBeDefined()
   })
 
   it('uses the native back action to close the top layer before leaving the reader', () => {
